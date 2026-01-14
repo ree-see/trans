@@ -1,0 +1,47 @@
+# Virtual Environment
+.venv/
+venv/
+env/
+ENV/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Output files (transcripts)
+*.txt
+*.srt
+*.vtt
+*.json
+*.tsv
+*.mp3
+*.mp4
+*.webm
+*.wav
+
+# Exceptions - keep README
+!README.md
+!requirements.txt
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Logs
+*.log
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
