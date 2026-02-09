@@ -10,8 +10,16 @@ import sys
 import subprocess
 import json
 import re
+import hashlib
+import sqlite3
 from pathlib import Path
 from datetime import datetime
+
+try:
+    from tqdm import tqdm
+    HAS_TQDM = True
+except ImportError:
+    HAS_TQDM = False
 
 
 # Get the paths to executables from the venv
@@ -19,11 +27,78 @@ SCRIPT_DIR = Path(__file__).parent
 YT_DLP = str(SCRIPT_DIR / '.venv' / 'bin' / 'yt-dlp')
 WHISPER = str(SCRIPT_DIR / '.venv' / 'bin' / 'whisper')
 
+# Cache directory
+CACHE_DIR = SCRIPT_DIR / '.cache'
+CACHE_DB = CACHE_DIR / 'transcripts.db'
+
 # Supported Whisper models
 WHISPER_MODELS = ['tiny', 'base', 'small', 'medium', 'large']
 
 # Supported output formats
 OUTPUT_FORMATS = ['txt', 'srt', 'vtt', 'json', 'all']
+
+
+# ============== Cache Functions ==============
+
+def init_cache():
+    """Initialize the cache database."""
+    CACHE_DIR.mkdir(exist_ok=True)
+    conn = sqlite3.connect(CACHE_DB)
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS transcripts (
+            video_id TEXT PRIMARY KEY,
+            url TEXT,
+            title TEXT,
+            transcript TEXT,
+            format TEXT,
+            model TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    conn.commit()
+    conn.close()
+
+
+def get_video_id(url):
+    """Extract a unique video ID from URL."""
+    # YouTube
+    if 'youtube.com' in url or 'youtu.be' in url:
+        match = re.search(r'(?:v=|youtu\.be/)([a-zA-Z0-9_-]{11})', url)
+        if match:
+            return f"yt_{match.group(1)}"
+    # TikTok
+    if 'tiktok.com' in url:
+        match = re.search(r'/video/(\d+)', url)
+        if match:
+            return f"tt_{match.group(1)}"
+    # Fallback: hash the URL
+    return f"hash_{hashlib.md5(url.encode()).hexdigest()[:12]}"
+
+
+def get_cached_transcript(video_id, fmt='txt'):
+    """Check if transcript is cached."""
+    if not CACHE_DB.exists():
+        return None
+    conn = sqlite3.connect(CACHE_DB)
+    cursor = conn.execute(
+        'SELECT transcript, title FROM transcripts WHERE video_id = ? AND format = ?',
+        (video_id, fmt)
+    )
+    row = cursor.fetchone()
+    conn.close()
+    return row if row else None
+
+
+def cache_transcript(video_id, url, title, transcript, fmt='txt', model=None):
+    """Save transcript to cache."""
+    init_cache()
+    conn = sqlite3.connect(CACHE_DB)
+    conn.execute('''
+        INSERT OR REPLACE INTO transcripts (video_id, url, title, transcript, format, model)
+        VALUES (?, ?, ?, ?, ?, ?)
+    ''', (video_id, url, title, transcript, fmt, model))
+    conn.commit()
+    conn.close()
 
 
 def copy_to_clipboard(text):
@@ -204,6 +279,44 @@ def transcribe_with_whisper(url, output_file, model='base', language=None,
 
 def process_url(url, args):
     """Process a single URL."""
+    # Get video ID for caching
+    video_id = get_video_id(url)
+    
+    # Check cache first (unless --no-cache)
+    if not getattr(args, 'no_cache', False):
+        cached = get_cached_transcript(video_id, args.format if args.format != 'all' else 'txt')
+        if cached:
+            transcript, title = cached
+            if not args.quiet:
+                print(f"\n💾 Using cached transcript for: {title}")
+            
+            # Determine output filename
+            if args.output:
+                output_base = args.output
+            else:
+                safe_title = sanitize_filename(title)
+                if args.timestamp:
+                    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+                    output_base = f"{safe_title}_{timestamp}"
+                else:
+                    output_base = safe_title
+            
+            # Write cached transcript to file
+            output_file = f"{output_base}.{args.format if args.format != 'all' else 'txt'}"
+            with open(output_file, 'w', encoding='utf-8') as f:
+                f.write(transcript)
+            
+            if not args.quiet:
+                print(f"✓ Transcript written to {output_file}")
+            
+            # Copy to clipboard if requested
+            if args.clipboard:
+                if copy_to_clipboard(transcript):
+                    if not args.quiet:
+                        print(f"📋 Copied to clipboard")
+            
+            return True
+    
     # Get video info for title
     info = get_video_info(url, args.quiet)
     video_title = info.get('title', 'video')
@@ -243,6 +356,15 @@ def process_url(url, args):
                 if os.path.exists(f):
                     print(f"  → {f}")
 
+        # Cache the transcript
+        if not getattr(args, 'no_cache', False):
+            txt_file = f"{output_base}.txt"
+            if os.path.exists(txt_file):
+                with open(txt_file, 'r', encoding='utf-8') as f:
+                    cache_transcript(video_id, url, video_title, f.read(), 'txt')
+                if not args.quiet:
+                    print(f"💾 Cached for future use")
+
         # Copy to clipboard if requested
         if args.clipboard and os.path.exists(f"{output_base}.txt"):
             with open(f"{output_base}.txt", 'r') as f:
@@ -269,6 +391,15 @@ def process_url(url, args):
                 if os.path.exists(f):
                     size = os.path.getsize(f)
                     print(f"  → {f} ({size} bytes)")
+
+        # Cache the transcript
+        if not getattr(args, 'no_cache', False):
+            txt_file = f"{output_base}.txt"
+            if os.path.exists(txt_file):
+                with open(txt_file, 'r', encoding='utf-8') as f:
+                    cache_transcript(video_id, url, video_title, f.read(), 'txt', args.model)
+                if not args.quiet:
+                    print(f"💾 Cached for future use")
 
         # Copy to clipboard if requested
         if args.clipboard and os.path.exists(f"{output_base}.txt"):
@@ -333,7 +464,24 @@ Examples:
                        action='store_true',
                        help='Minimal output (errors only)')
 
+    parser.add_argument('--no-cache',
+                       action='store_true',
+                       help='Skip cache lookup and force fresh transcription')
+
+    parser.add_argument('--clear-cache',
+                       action='store_true',
+                       help='Clear the transcript cache and exit')
+
     args = parser.parse_args()
+    
+    # Handle cache clearing
+    if args.clear_cache:
+        if CACHE_DB.exists():
+            os.remove(CACHE_DB)
+            print("✓ Cache cleared")
+        else:
+            print("Cache is already empty")
+        sys.exit(0)
 
     # Validate arguments
     if args.output and len(args.urls) > 1:
