@@ -202,7 +202,23 @@ options:
   -k, --keep-audio      Keep downloaded audio file
   -t, --timestamp       Add timestamp to filename
   -q, --quiet           Minimal output (errors only)
+  --cookies PATH        Path to cookies.txt file (for TikTok, etc.)
 ```
+
+## TikTok Notes
+
+TikTok aggressively blocks datacenter/VPS IP addresses. If you see "IP address is blocked", try:
+
+1. **Use cookies**: Export cookies from your logged-in browser session using an extension like "Get cookies.txt", then:
+   ```bash
+   trans --cookies cookies.txt "https://tiktok.com/@user/video/123"
+   ```
+
+2. **Run from a residential IP**: TikTok usually works from home internet connections
+
+3. **Use a VPN**: Connect to a residential VPN endpoint
+
+The tool automatically uses browser impersonation (Chrome) when accessing TikTok, but IP-level blocks still apply.
 
 ## Tips
 

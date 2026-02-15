@@ -122,15 +122,47 @@ def sanitize_filename(title, max_length=50):
     return safe.strip('_')[:max_length]
 
 
-def get_video_info(url, quiet=False):
+def is_tiktok_url(url):
+    """Check if URL is a TikTok video."""
+    return 'tiktok.com' in url or 'vm.tiktok.com' in url
+
+
+def get_video_info(url, quiet=False, cookies=None):
     """Get video information using yt-dlp."""
     try:
-        cmd = [YT_DLP, '--dump-json', '--no-download', url]
+        cmd = [YT_DLP, '--dump-json', '--no-download']
+        
+        # Use browser impersonation for TikTok
+        if is_tiktok_url(url):
+            cmd.extend(['--impersonate', 'chrome-131'])
+        
+        # Add cookies if provided
+        if cookies:
+            cmd.extend(['--cookies', cookies])
+        
+        cmd.append(url)
         result = subprocess.run(cmd, capture_output=True, text=True, check=True)
         return json.loads(result.stdout)
     except subprocess.CalledProcessError as e:
+        error_msg = e.stderr.strip() if e.stderr else str(e)
+        
+        # Check for TikTok IP block
+        if is_tiktok_url(url) and ('IP address is blocked' in error_msg or 'blocked' in error_msg.lower()):
+            if not quiet:
+                print("✗ TikTok is blocking this server's IP address.")
+                print("")
+                print("Workarounds:")
+                print("  1. Use --cookies to provide cookies from a logged-in browser session")
+                print("     Export cookies with a browser extension like 'Get cookies.txt'")
+                print("     Then: trans --cookies cookies.txt 'TIKTOK_URL'")
+                print("")
+                print("  2. Run trans from a residential IP (not a datacenter/VPS)")
+                print("")
+                print("  3. Use a VPN or proxy with a non-datacenter IP")
+            sys.exit(1)
+        
         if not quiet:
-            print(f"✗ Error fetching video info: {e.stderr.strip()}")
+            print(f"✗ Error fetching video info: {error_msg}")
         sys.exit(1)
     except json.JSONDecodeError:
         if not quiet:
@@ -202,7 +234,8 @@ def extract_native_captions(url, output_file, output_format='txt', quiet=False):
 
 
 def transcribe_with_whisper(url, output_file, model='base', language=None,
-                            output_format='txt', keep_audio=False, quiet=False):
+                            output_format='txt', keep_audio=False, quiet=False,
+                            cookies=None):
     """Download audio and transcribe with Whisper."""
     if not quiet:
         print("→ Using Whisper transcription...")
@@ -219,8 +252,17 @@ def transcribe_with_whisper(url, output_file, model='base', language=None,
             '--extract-audio',
             '--audio-format', 'mp3',
             '--output', audio_file,
-            url
         ]
+        
+        # Use browser impersonation for TikTok
+        if is_tiktok_url(url):
+            cmd.extend(['--impersonate', 'chrome-131'])
+        
+        # Add cookies if provided
+        if cookies:
+            cmd.extend(['--cookies', cookies])
+        
+        cmd.append(url)
         result = subprocess.run(cmd, capture_output=True, text=True, check=True)
 
         # Transcribe with Whisper
@@ -282,6 +324,9 @@ def process_url(url, args):
     # Get video ID for caching
     video_id = get_video_id(url)
     
+    # Get cookies path if provided
+    cookies = getattr(args, 'cookies', None)
+    
     # Check cache first (unless --no-cache)
     if not getattr(args, 'no_cache', False):
         cached = get_cached_transcript(video_id, args.format if args.format != 'all' else 'txt')
@@ -318,7 +363,7 @@ def process_url(url, args):
             return True
     
     # Get video info for title
-    info = get_video_info(url, args.quiet)
+    info = get_video_info(url, args.quiet, cookies)
     video_title = info.get('title', 'video')
     duration = info.get('duration', 0)
 
@@ -376,7 +421,7 @@ def process_url(url, args):
 
     # Fall back to Whisper
     if transcribe_with_whisper(url, output_base, args.model, args.language,
-                               args.format, args.keep_audio, args.quiet):
+                               args.format, args.keep_audio, args.quiet, cookies):
         output_files = []
         if args.format == 'all':
             for ext in ['txt', 'srt', 'vtt', 'json', 'tsv']:
@@ -463,6 +508,9 @@ Examples:
     parser.add_argument('-q', '--quiet',
                        action='store_true',
                        help='Minimal output (errors only)')
+
+    parser.add_argument('--cookies',
+                       help='Path to cookies.txt file (for authenticated downloads, e.g. TikTok)')
 
     parser.add_argument('--no-cache',
                        action='store_true',
