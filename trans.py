@@ -28,6 +28,12 @@ try:
 except ImportError:
     HAS_RICH = False
 
+try:
+    from faster_whisper import WhisperModel
+    HAS_FASTER_WHISPER = True
+except ImportError:
+    HAS_FASTER_WHISPER = False
+
 
 # Get the paths to executables from the venv
 SCRIPT_DIR = Path(__file__).parent
@@ -244,6 +250,134 @@ def transcribe_audio_with_progress(audio_file, output_base, model='base', langua
         raise subprocess.CalledProcessError(process.returncode, cmd)
 
 
+def transcribe_with_faster_whisper(audio_file, output_base, model='base', language=None,
+                                   output_format='txt', quiet=False):
+    """Transcribe using faster-whisper (CTranslate2-based, much faster)."""
+    if not HAS_FASTER_WHISPER:
+        raise ImportError("faster-whisper not installed")
+    
+    # Map model names (faster-whisper uses same names)
+    model_name = model
+    
+    if not quiet:
+        print(f"  Loading {model_name} model...")
+    
+    # Load model (will download on first use)
+    whisper_model = WhisperModel(model_name, device="cpu", compute_type="int8")
+    
+    # Get audio duration for progress calculation
+    import subprocess
+    result = subprocess.run(
+        ['ffprobe', '-v', 'error', '-show_entries', 'format=duration',
+         '-of', 'default=noprint_wrappers=1:nokey=1', audio_file],
+        capture_output=True, text=True
+    )
+    total_duration = float(result.stdout.strip()) if result.stdout.strip() else 0
+    
+    if not quiet:
+        print(f"  Transcribing...")
+    
+    # Transcribe with progress
+    pbar = None
+    if HAS_TQDM and total_duration > 0 and not quiet:
+        pbar = tqdm(total=100, desc="  Progress", unit="%",
+                    bar_format='{desc}: {bar:30} {percentage:3.0f}%')
+    
+    segments_list = []
+    last_percent = 0
+    
+    segments, info = whisper_model.transcribe(
+        audio_file,
+        language=language,
+        beam_size=5,
+        vad_filter=False,  # VAD can cause issues with some audio files
+    )
+    
+    # Collect all segments (generator is consumed during iteration)
+    for segment in segments:
+        seg_data = {
+            'start': segment.start,
+            'end': segment.end,
+            'text': segment.text.strip()
+        }
+        segments_list.append(seg_data)
+        
+        # Update progress based on segment end time
+        if pbar and total_duration > 0:
+            percent = min(100, (segment.end / total_duration) * 100)
+            pbar.update(percent - last_percent)
+            last_percent = percent
+        elif not quiet:
+            # Print inline progress without tqdm
+            if total_duration > 0:
+                percent = min(100, (segment.end / total_duration) * 100)
+                sys.stdout.write(f"\r  Progress: {percent:.0f}%")
+                sys.stdout.flush()
+    
+    if pbar:
+        pbar.update(100 - last_percent)  # Ensure we hit 100%
+        pbar.close()
+    elif not quiet:
+        print()  # Newline after progress
+    
+    if not quiet and not segments_list:
+        print("  Warning: No speech detected in audio")
+    
+    # Generate output files
+    if output_format in ['txt', 'all']:
+        txt_output = f"{output_base}.txt"
+        with open(txt_output, 'w', encoding='utf-8') as f:
+            for seg in segments_list:
+                f.write(seg['text'] + '\n')
+    
+    if output_format in ['srt', 'all']:
+        srt_output = f"{output_base}.srt"
+        with open(srt_output, 'w', encoding='utf-8') as f:
+            for i, seg in enumerate(segments_list, 1):
+                start_time = format_timestamp_srt(seg['start'])
+                end_time = format_timestamp_srt(seg['end'])
+                f.write(f"{i}\n{start_time} --> {end_time}\n{seg['text']}\n\n")
+    
+    if output_format in ['vtt', 'all']:
+        vtt_output = f"{output_base}.vtt"
+        with open(vtt_output, 'w', encoding='utf-8') as f:
+            f.write("WEBVTT\n\n")
+            for seg in segments_list:
+                start_time = format_timestamp_vtt(seg['start'])
+                end_time = format_timestamp_vtt(seg['end'])
+                f.write(f"{start_time} --> {end_time}\n{seg['text']}\n\n")
+    
+    if output_format in ['json', 'all']:
+        json_output = f"{output_base}.json"
+        with open(json_output, 'w', encoding='utf-8') as f:
+            json.dump({
+                'language': info.language,
+                'language_probability': info.language_probability,
+                'duration': info.duration,
+                'segments': segments_list
+            }, f, indent=2)
+    
+    return segments_list
+
+
+def format_timestamp_srt(seconds):
+    """Format seconds as SRT timestamp (HH:MM:SS,mmm)."""
+    hours = int(seconds // 3600)
+    minutes = int((seconds % 3600) // 60)
+    secs = int(seconds % 60)
+    millis = int((seconds % 1) * 1000)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d},{millis:03d}"
+
+
+def format_timestamp_vtt(seconds):
+    """Format seconds as VTT timestamp (HH:MM:SS.mmm)."""
+    hours = int(seconds // 3600)
+    minutes = int((seconds % 3600) // 60)
+    secs = int(seconds % 60)
+    millis = int((seconds % 1) * 1000)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}.{millis:03d}"
+
+
 def get_video_info(url, quiet=False, cookies=None):
     """Get video information using yt-dlp."""
     try:
@@ -355,7 +489,8 @@ def transcribe_with_whisper(url, output_file, model='base', language=None,
                             cookies=None):
     """Download audio and transcribe with Whisper."""
     if not quiet:
-        print("→ Using Whisper transcription...")
+        backend = "faster-whisper" if HAS_FASTER_WHISPER else "openai-whisper CLI"
+        print(f"→ Using Whisper transcription ({backend})...")
 
     audio_file = f"{output_file}.audio.mp3"
 
@@ -366,25 +501,31 @@ def transcribe_with_whisper(url, output_file, model='base', language=None,
         
         download_audio_with_progress(url, audio_file, cookies, quiet)
 
-        # Transcribe with Whisper with progress bar
+        # Transcribe with Whisper
         if not quiet:
             print(f"→ Transcribing with Whisper ({model} model)...")
 
-        transcribe_audio_with_progress(audio_file, output_file, model, language,
-                                       output_format, quiet)
+        if HAS_FASTER_WHISPER:
+            # Use faster-whisper (Python API, much faster)
+            transcribe_with_faster_whisper(audio_file, output_file, model, language,
+                                           output_format, quiet)
+        else:
+            # Fall back to openai-whisper CLI
+            transcribe_audio_with_progress(audio_file, output_file, model, language,
+                                           output_format, quiet)
 
-        # Whisper creates files with format: {audio_file_without_ext}.{format}
-        base_name = audio_file.replace('.mp3', '')
+            # Whisper CLI creates files with format: {audio_file_without_ext}.{format}
+            base_name = audio_file.replace('.mp3', '')
 
-        # Move output files to desired location
-        formats_to_move = [output_format] if output_format != 'all' else ['txt', 'srt', 'vtt', 'json', 'tsv']
+            # Move output files to desired location
+            formats_to_move = [output_format] if output_format != 'all' else ['txt', 'srt', 'vtt', 'json', 'tsv']
 
-        for fmt in formats_to_move:
-            whisper_output = f"{base_name}.{fmt}"
-            final_output = f"{output_file}.{fmt}"
+            for fmt in formats_to_move:
+                whisper_output = f"{base_name}.{fmt}"
+                final_output = f"{output_file}.{fmt}"
 
-            if os.path.exists(whisper_output) and whisper_output != final_output:
-                os.rename(whisper_output, final_output)
+                if os.path.exists(whisper_output) and whisper_output != final_output:
+                    os.rename(whisper_output, final_output)
 
         # Clean up audio file unless requested to keep
         if not keep_audio and os.path.exists(audio_file):
@@ -395,6 +536,13 @@ def transcribe_with_whisper(url, output_file, model='base', language=None,
         return True
 
     except subprocess.CalledProcessError as e:
+        if not quiet:
+            print(f"✗ Error during transcription: {e}")
+        # Clean up audio file on error
+        if os.path.exists(audio_file):
+            os.remove(audio_file)
+        return False
+    except Exception as e:
         if not quiet:
             print(f"✗ Error during transcription: {e}")
         # Clean up audio file on error
