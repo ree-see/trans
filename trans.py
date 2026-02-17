@@ -21,6 +21,13 @@ try:
 except ImportError:
     HAS_TQDM = False
 
+try:
+    from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TimeElapsedColumn
+    from rich.console import Console
+    HAS_RICH = True
+except ImportError:
+    HAS_RICH = False
+
 
 # Get the paths to executables from the venv
 SCRIPT_DIR = Path(__file__).parent
@@ -125,6 +132,116 @@ def sanitize_filename(title, max_length=50):
 def is_tiktok_url(url):
     """Check if URL is a TikTok video."""
     return 'tiktok.com' in url or 'vm.tiktok.com' in url
+
+
+def download_audio_with_progress(url, output_file, cookies=None, quiet=False):
+    """Download audio with a progress bar."""
+    cmd = [
+        YT_DLP,
+        '--extract-audio',
+        '--audio-format', 'mp3',
+        '--output', output_file,
+        '--newline',  # Output progress on new lines for parsing
+    ]
+    
+    # Use browser impersonation for TikTok
+    if is_tiktok_url(url):
+        cmd.extend(['--impersonate', 'chrome-131'])
+    
+    # Add cookies if provided
+    if cookies:
+        cmd.extend(['--cookies', cookies])
+    
+    cmd.append(url)
+    
+    if quiet:
+        subprocess.run(cmd, capture_output=True, check=True)
+        return
+    
+    # Parse yt-dlp progress output
+    process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, 
+                               text=True, bufsize=1)
+    
+    pbar = None
+    if HAS_TQDM:
+        pbar = tqdm(total=100, desc="  Downloading", unit="%", 
+                    bar_format='{desc}: {bar:30} {percentage:3.0f}%')
+    
+    last_percent = 0
+    for line in process.stdout:
+        # Parse progress like "[download]  50.0% of 5.00MiB"
+        if '[download]' in line and '%' in line:
+            match = re.search(r'(\d+(?:\.\d+)?)\s*%', line)
+            if match:
+                percent = float(match.group(1))
+                if pbar:
+                    pbar.update(percent - last_percent)
+                    last_percent = percent
+                elif not quiet:
+                    sys.stdout.write(f"\r  Downloading: {percent:.0f}%")
+                    sys.stdout.flush()
+    
+    if pbar:
+        pbar.close()
+    elif not quiet:
+        print()  # Newline after progress
+    
+    process.wait()
+    if process.returncode != 0:
+        raise subprocess.CalledProcessError(process.returncode, cmd)
+
+
+def transcribe_audio_with_progress(audio_file, output_base, model='base', language=None,
+                                   output_format='txt', quiet=False):
+    """Run Whisper transcription with progress indication."""
+    cmd = [WHISPER, audio_file, '--model', model]
+    
+    if language:
+        cmd.extend(['--language', language])
+    
+    # Handle output formats
+    if output_format == 'all':
+        cmd.extend(['--output_format', 'all'])
+    else:
+        cmd.extend(['--output_format', output_format])
+    
+    cmd.extend(['--output_dir', os.path.dirname(output_base) or '.'])
+    
+    if quiet:
+        subprocess.run(cmd, capture_output=True, check=True)
+        return
+    
+    # Run Whisper with progress parsing
+    process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                               text=True, bufsize=1)
+    
+    pbar = None
+    if HAS_TQDM:
+        pbar = tqdm(total=100, desc="  Transcribing", unit="%",
+                    bar_format='{desc}: {bar:30} {percentage:3.0f}%')
+    
+    last_percent = 0
+    for line in process.stdout:
+        # Whisper outputs progress like "50%|████..." or timing info
+        if '%|' in line:
+            match = re.search(r'(\d+)%', line)
+            if match:
+                percent = int(match.group(1))
+                if pbar:
+                    pbar.update(percent - last_percent)
+                    last_percent = percent
+                elif not quiet:
+                    sys.stdout.write(f"\r  Transcribing: {percent}%")
+                    sys.stdout.flush()
+    
+    if pbar:
+        pbar.close()
+    elif not quiet:
+        print()  # Newline after progress
+    
+    process.wait()
+    if process.returncode != 0:
+        raise subprocess.CalledProcessError(process.returncode, cmd)
 
 
 def get_video_info(url, quiet=False, cookies=None):
@@ -243,51 +360,18 @@ def transcribe_with_whisper(url, output_file, model='base', language=None,
     audio_file = f"{output_file}.audio.mp3"
 
     try:
-        # Download audio
+        # Download audio with progress bar
         if not quiet:
             print(f"→ Downloading audio...")
+        
+        download_audio_with_progress(url, audio_file, cookies, quiet)
 
-        cmd = [
-            YT_DLP,
-            '--extract-audio',
-            '--audio-format', 'mp3',
-            '--output', audio_file,
-        ]
-        
-        # Use browser impersonation for TikTok
-        if is_tiktok_url(url):
-            cmd.extend(['--impersonate', 'chrome-131'])
-        
-        # Add cookies if provided
-        if cookies:
-            cmd.extend(['--cookies', cookies])
-        
-        cmd.append(url)
-        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
-
-        # Transcribe with Whisper
+        # Transcribe with Whisper with progress bar
         if not quiet:
             print(f"→ Transcribing with Whisper ({model} model)...")
 
-        # Prepare Whisper command
-        cmd = [WHISPER, audio_file, '--model', model]
-
-        if language:
-            cmd.extend(['--language', language])
-
-        # Handle output formats
-        if output_format == 'all':
-            cmd.extend(['--output_format', 'all'])
-        else:
-            cmd.extend(['--output_format', output_format])
-
-        cmd.extend(['--output_dir', os.path.dirname(output_file) or '.'])
-
-        # Run Whisper (show progress unless quiet)
-        if quiet:
-            subprocess.run(cmd, capture_output=True, check=True)
-        else:
-            subprocess.run(cmd, check=True)
+        transcribe_audio_with_progress(audio_file, output_file, model, language,
+                                       output_format, quiet)
 
         # Whisper creates files with format: {audio_file_without_ext}.{format}
         base_name = audio_file.replace('.mp3', '')
@@ -387,8 +471,8 @@ def process_url(url, args):
             print(f"⏱️  Duration: {int(mins)}:{int(secs):02d}")
         print(f"{'='*60}\n")
 
-    # Try native captions first (mainly for YouTube)
-    if extract_native_captions(url, output_base, args.format, args.quiet):
+    # Try native captions first (mainly for YouTube), unless --force-whisper
+    if not getattr(args, 'force_whisper', False) and extract_native_captions(url, output_base, args.format, args.quiet):
         output_files = []
         if args.format == 'all':
             output_files = [f"{output_base}.txt", f"{output_base}.vtt"]
@@ -519,6 +603,10 @@ Examples:
     parser.add_argument('--clear-cache',
                        action='store_true',
                        help='Clear the transcript cache and exit')
+
+    parser.add_argument('--force-whisper',
+                       action='store_true',
+                       help='Skip native captions and always use Whisper')
 
     args = parser.parse_args()
     
