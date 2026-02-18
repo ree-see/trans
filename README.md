@@ -1,9 +1,10 @@
 # Trans - Video Transcription Tool
 
-Quick command-line tool to transcribe YouTube and TikTok videos to text.
+Quick command-line tool to transcribe YouTube, TikTok, and Twitch videos to text.
 
 ## Features
 
+- **Multi-platform support**: YouTube, TikTok, and Twitch (VODs and clips)
 - **Automatic source selection**: Tries native captions first (YouTube), falls back to Whisper AI
 - **Multiple output formats**: TXT, SRT, VTT, JSON, or all formats at once
 - **Whisper model selection**: Choose from tiny, base, small, medium, or large models
@@ -36,6 +37,12 @@ trans "https://youtube.com/watch?v=..."
 
 # Custom output name
 trans -o my_video "https://tiktok.com/@user/video/123"
+
+# Twitch VOD
+trans "https://twitch.tv/videos/123456789"
+
+# Twitch clip
+trans "https://clips.twitch.tv/FunnyClipName"
 
 # Copy to clipboard automatically
 trans -c "https://youtube.com/watch?v=..."
@@ -190,7 +197,7 @@ Depending on format, you'll get:
 
 ```
 positional arguments:
-  URL                   YouTube or TikTok video URL(s)
+  URL                   YouTube, TikTok, or Twitch video URL(s)
 
 options:
   -h, --help            Show help message
@@ -203,7 +210,19 @@ options:
   -t, --timestamp       Add timestamp to filename
   -q, --quiet           Minimal output (errors only)
   --cookies PATH        Path to cookies.txt file (for TikTok, etc.)
+  --force-whisper       Skip native captions, always use Whisper
 ```
+
+## Twitch Notes
+
+Twitch VODs and clips work well out of the box:
+
+- **VODs**: Full stream recordings (https://twitch.tv/videos/123456789)
+- **Clips**: Short highlights (https://clips.twitch.tv/ClipName)
+
+Twitch videos rarely have native captions, so trans will use Whisper transcription. For long VODs, consider:
+- Use `-m tiny` or `-m base` for faster transcription
+- Use `--force-whisper` if you want to skip caption checks
 
 ## TikTok Notes
 
@@ -224,10 +243,11 @@ The tool automatically uses browser impersonation (Chrome) when accessing TikTok
 
 1. **YouTube videos**: Usually have native captions (faster)
 2. **TikTok videos**: Always use Whisper (more accurate for short clips)
-3. **Long videos**: Use `-m tiny` or `-m base` for speed
-4. **Accuracy matters**: Use `-m medium` or `-m large`
-5. **Scripting**: Use `-q` for clean output in scripts
-6. **Clipboard workflow**: Use `-c -q` for copy-paste workflow
+3. **Twitch VODs**: Use smaller models for long streams
+4. **Long videos**: Use `-m tiny` or `-m base` for speed
+5. **Accuracy matters**: Use `-m medium` or `-m large`
+6. **Scripting**: Use `-q` for clean output in scripts
+7. **Clipboard workflow**: Use `-c -q` for copy-paste workflow
 
 ## Troubleshooting
 

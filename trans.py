@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Quick transcribe tool for YouTube and TikTok videos.
+Quick transcribe tool for YouTube, TikTok, and Twitch videos.
 Tries native captions first, falls back to Whisper transcription.
 """
 
@@ -84,6 +84,16 @@ def get_video_id(url):
         match = re.search(r'/video/(\d+)', url)
         if match:
             return f"tt_{match.group(1)}"
+    # Twitch VOD
+    if 'twitch.tv' in url:
+        # VOD format: twitch.tv/videos/123456789
+        match = re.search(r'/videos/(\d+)', url)
+        if match:
+            return f"tw_{match.group(1)}"
+        # Clip format: twitch.tv/channel/clip/ClipSlug or clips.twitch.tv/ClipSlug
+        match = re.search(r'/clip/([a-zA-Z0-9_-]+)', url) or re.search(r'clips\.twitch\.tv/([a-zA-Z0-9_-]+)', url)
+        if match:
+            return f"twclip_{match.group(1)}"
     # Fallback: hash the URL
     return f"hash_{hashlib.md5(url.encode()).hexdigest()[:12]}"
 
@@ -138,6 +148,11 @@ def sanitize_filename(title, max_length=50):
 def is_tiktok_url(url):
     """Check if URL is a TikTok video."""
     return 'tiktok.com' in url or 'vm.tiktok.com' in url
+
+
+def is_twitch_url(url):
+    """Check if URL is a Twitch video (VOD, clip, or stream)."""
+    return 'twitch.tv' in url
 
 
 def download_audio_with_progress(url, output_file, cookies=None, quiet=False):
@@ -694,12 +709,14 @@ def process_url(url, args):
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Transcribe YouTube or TikTok videos to text.',
+        description='Transcribe YouTube, TikTok, or Twitch videos to text.',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
   trans "https://youtube.com/watch?v=..."
   trans -o my_video "https://tiktok.com/..."
+  trans "https://twitch.tv/videos/123456789"  # Twitch VOD
+  trans "https://clips.twitch.tv/FunnyClipName"  # Twitch clip
   trans --model small --format srt "https://youtube.com/..."
   trans --clipboard --quiet "https://youtube.com/..."
   trans "url1" "url2" "url3"  # Batch processing
@@ -707,7 +724,7 @@ Examples:
     )
 
     parser.add_argument('urls', nargs='+', metavar='URL',
-                       help='YouTube or TikTok video URL(s)')
+                       help='YouTube, TikTok, or Twitch video URL(s)')
 
     parser.add_argument('-o', '--output',
                        help='Output file path (without extension). Only for single URL.')
