@@ -18,14 +18,48 @@ Quick command-line tool to transcribe YouTube, TikTok, and Twitch videos to text
 
 ## Installation
 
+### Via pip (recommended)
+
 ```bash
-# Clone/download to ~/dev/trans
-cd ~/dev/trans
+# Basic installation
+pip install trans-cli
 
-# Run setup
-./setup.sh
+# With speaker diarization support
+pip install trans-cli[diarize]
 
-# The 'trans' command is now available system-wide
+# With all optional features
+pip install trans-cli[all]
+```
+
+### From source
+
+```bash
+# Clone the repository
+git clone https://github.com/ree-see/trans.git
+cd trans
+
+# Install in development mode
+pip install -e .
+
+# Or with optional features
+pip install -e ".[all]"
+```
+
+### Requirements
+
+- Python 3.9+
+- FFmpeg (for audio extraction)
+
+**Install FFmpeg:**
+```bash
+# macOS
+brew install ffmpeg
+
+# Ubuntu/Debian
+sudo apt install ffmpeg
+
+# Fedora
+sudo dnf install ffmpeg
 ```
 
 ## Usage

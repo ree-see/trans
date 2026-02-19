@@ -41,10 +41,27 @@ except ImportError:
     HAS_PYANNOTE = False
 
 
-# Get the paths to executables from the venv
+# Get the paths to executables
+# First try to find them in the same environment as this script
+import shutil
 SCRIPT_DIR = Path(__file__).parent
-YT_DLP = str(SCRIPT_DIR / '.venv' / 'bin' / 'yt-dlp')
-WHISPER = str(SCRIPT_DIR / '.venv' / 'bin' / 'whisper')
+
+def find_executable(name, venv_path=None):
+    """Find an executable, preferring venv if available."""
+    # Check venv first (for development installs)
+    if venv_path:
+        venv_bin = SCRIPT_DIR / venv_path / 'bin' / name
+        if venv_bin.exists():
+            return str(venv_bin)
+    # Fall back to system PATH
+    path = shutil.which(name)
+    if path:
+        return path
+    # Default to just the name (let the OS find it)
+    return name
+
+YT_DLP = find_executable('yt-dlp', '.venv')
+WHISPER = find_executable('whisper', '.venv')
 
 # Cache directory
 CACHE_DIR = SCRIPT_DIR / '.cache'

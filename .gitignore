@@ -45,3 +45,6 @@ __pycache__/
 build/
 dist/
 *.egg-info/
+
+# Cache
+.cache/
