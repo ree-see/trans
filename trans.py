@@ -34,6 +34,12 @@ try:
 except ImportError:
     HAS_FASTER_WHISPER = False
 
+try:
+    from pyannote.audio import Pipeline as DiarizationPipeline
+    HAS_PYANNOTE = True
+except ImportError:
+    HAS_PYANNOTE = False
+
 
 # Get the paths to executables from the venv
 SCRIPT_DIR = Path(__file__).parent
@@ -266,7 +272,8 @@ def transcribe_audio_with_progress(audio_file, output_base, model='base', langua
 
 
 def transcribe_with_faster_whisper(audio_file, output_base, model='base', language=None,
-                                   output_format='txt', quiet=False):
+                                   output_format='txt', quiet=False, diarize=False,
+                                   num_speakers=None, hf_token=None):
     """Transcribe using faster-whisper (CTranslate2-based, much faster)."""
     if not HAS_FASTER_WHISPER:
         raise ImportError("faster-whisper not installed")
@@ -338,12 +345,37 @@ def transcribe_with_faster_whisper(audio_file, output_base, model='base', langua
     if not quiet and not segments_list:
         print("  Warning: No speech detected in audio")
     
+    # Run speaker diarization if requested
+    if diarize:
+        try:
+            diarization_segments = run_diarization(audio_file, hf_token, num_speakers, quiet)
+            segments_list = assign_speakers_to_segments(segments_list, diarization_segments)
+        except Exception as e:
+            if not quiet:
+                print(f"  Warning: Diarization failed: {e}")
+                print("  Continuing without speaker labels...")
+    
+    # Check if we have speaker labels
+    has_speakers = diarize and segments_list and 'speaker' in segments_list[0]
+    
     # Generate output files
     if output_format in ['txt', 'all']:
         txt_output = f"{output_base}.txt"
         with open(txt_output, 'w', encoding='utf-8') as f:
-            for seg in segments_list:
-                f.write(seg['text'] + '\n')
+            if has_speakers:
+                # Group consecutive segments by speaker for readable output
+                current_speaker = None
+                for seg in segments_list:
+                    speaker = format_speaker_label(seg.get('speaker', 'UNKNOWN'))
+                    if speaker != current_speaker:
+                        if current_speaker is not None:
+                            f.write('\n')
+                        f.write(f"[{speaker}]\n")
+                        current_speaker = speaker
+                    f.write(seg['text'] + '\n')
+            else:
+                for seg in segments_list:
+                    f.write(seg['text'] + '\n')
     
     if output_format in ['srt', 'all']:
         srt_output = f"{output_base}.srt"
@@ -351,7 +383,11 @@ def transcribe_with_faster_whisper(audio_file, output_base, model='base', langua
             for i, seg in enumerate(segments_list, 1):
                 start_time = format_timestamp_srt(seg['start'])
                 end_time = format_timestamp_srt(seg['end'])
-                f.write(f"{i}\n{start_time} --> {end_time}\n{seg['text']}\n\n")
+                text = seg['text']
+                if has_speakers:
+                    speaker = format_speaker_label(seg.get('speaker', 'UNKNOWN'))
+                    text = f"[{speaker}] {text}"
+                f.write(f"{i}\n{start_time} --> {end_time}\n{text}\n\n")
     
     if output_format in ['vtt', 'all']:
         vtt_output = f"{output_base}.vtt"
@@ -360,17 +396,29 @@ def transcribe_with_faster_whisper(audio_file, output_base, model='base', langua
             for seg in segments_list:
                 start_time = format_timestamp_vtt(seg['start'])
                 end_time = format_timestamp_vtt(seg['end'])
-                f.write(f"{start_time} --> {end_time}\n{seg['text']}\n\n")
+                text = seg['text']
+                if has_speakers:
+                    speaker = format_speaker_label(seg.get('speaker', 'UNKNOWN'))
+                    # VTT supports <v Speaker> voice tags
+                    f.write(f"{start_time} --> {end_time}\n<v {speaker}>{text}\n\n")
+                else:
+                    f.write(f"{start_time} --> {end_time}\n{text}\n\n")
     
     if output_format in ['json', 'all']:
         json_output = f"{output_base}.json"
         with open(json_output, 'w', encoding='utf-8') as f:
-            json.dump({
+            output_data = {
                 'language': info.language,
                 'language_probability': info.language_probability,
                 'duration': info.duration,
+                'diarization': has_speakers,
                 'segments': segments_list
-            }, f, indent=2)
+            }
+            if has_speakers:
+                # Add speaker summary
+                speakers = set(seg.get('speaker') for seg in segments_list)
+                output_data['speakers'] = [format_speaker_label(s) for s in sorted(speakers)]
+            json.dump(output_data, f, indent=2)
     
     return segments_list
 
@@ -382,6 +430,118 @@ def format_timestamp_srt(seconds):
     secs = int(seconds % 60)
     millis = int((seconds % 1) * 1000)
     return f"{hours:02d}:{minutes:02d}:{secs:02d},{millis:03d}"
+
+
+def get_hf_token():
+    """Get HuggingFace token from environment or cache."""
+    # Check environment variable
+    token = os.environ.get('HF_TOKEN') or os.environ.get('HUGGING_FACE_HUB_TOKEN')
+    if token:
+        return token
+    
+    # Check huggingface-cli token cache
+    token_path = Path.home() / '.cache' / 'huggingface' / 'token'
+    if token_path.exists():
+        return token_path.read_text().strip()
+    
+    return None
+
+
+def run_diarization(audio_file, hf_token, num_speakers=None, quiet=False):
+    """
+    Run speaker diarization using pyannote-audio.
+    
+    Returns a list of (start, end, speaker) tuples.
+    """
+    if not HAS_PYANNOTE:
+        raise ImportError("pyannote-audio not installed. Run: pip install pyannote-audio")
+    
+    if not hf_token:
+        raise ValueError(
+            "HuggingFace token required for speaker diarization.\n"
+            "1. Create a token at https://huggingface.co/settings/tokens\n"
+            "2. Accept the model license at https://huggingface.co/pyannote/speaker-diarization-3.1\n"
+            "3. Set HF_TOKEN environment variable or run: huggingface-cli login"
+        )
+    
+    if not quiet:
+        print("  Loading diarization model...")
+    
+    # Load the diarization pipeline
+    pipeline = DiarizationPipeline.from_pretrained(
+        "pyannote/speaker-diarization-3.1",
+        use_auth_token=hf_token
+    )
+    
+    if not quiet:
+        print("  Running speaker diarization...")
+    
+    # Run diarization
+    diarization_args = {}
+    if num_speakers:
+        diarization_args['num_speakers'] = num_speakers
+    
+    diarization = pipeline(audio_file, **diarization_args)
+    
+    # Extract speaker segments
+    segments = []
+    for turn, _, speaker in diarization.itertracks(yield_label=True):
+        segments.append({
+            'start': turn.start,
+            'end': turn.end,
+            'speaker': speaker
+        })
+    
+    if not quiet:
+        unique_speakers = len(set(s['speaker'] for s in segments))
+        print(f"  Detected {unique_speakers} speaker(s)")
+    
+    return segments
+
+
+def assign_speakers_to_segments(transcript_segments, diarization_segments):
+    """
+    Merge transcript segments with speaker labels from diarization.
+    
+    Uses overlap-based assignment: each transcript segment gets the speaker
+    with the most overlap during that time range.
+    """
+    for t_seg in transcript_segments:
+        t_start, t_end = t_seg['start'], t_seg['end']
+        
+        # Find overlapping diarization segments
+        speaker_overlaps = {}
+        for d_seg in diarization_segments:
+            d_start, d_end = d_seg['start'], d_seg['end']
+            
+            # Calculate overlap
+            overlap_start = max(t_start, d_start)
+            overlap_end = min(t_end, d_end)
+            overlap = max(0, overlap_end - overlap_start)
+            
+            if overlap > 0:
+                speaker = d_seg['speaker']
+                speaker_overlaps[speaker] = speaker_overlaps.get(speaker, 0) + overlap
+        
+        # Assign speaker with most overlap
+        if speaker_overlaps:
+            t_seg['speaker'] = max(speaker_overlaps, key=speaker_overlaps.get)
+        else:
+            t_seg['speaker'] = 'UNKNOWN'
+    
+    return transcript_segments
+
+
+def format_speaker_label(speaker_id):
+    """Convert pyannote speaker ID (SPEAKER_00) to friendly label (Speaker 1)."""
+    if speaker_id == 'UNKNOWN':
+        return 'Unknown'
+    # Extract number from SPEAKER_XX format
+    match = re.search(r'(\d+)', speaker_id)
+    if match:
+        num = int(match.group(1)) + 1  # 0-indexed to 1-indexed
+        return f"Speaker {num}"
+    return speaker_id
 
 
 def format_timestamp_vtt(seconds):
@@ -501,11 +661,15 @@ def extract_native_captions(url, output_file, output_format='txt', quiet=False):
 
 def transcribe_with_whisper(url, output_file, model='base', language=None,
                             output_format='txt', keep_audio=False, quiet=False,
-                            cookies=None):
+                            cookies=None, diarize=False, num_speakers=None):
     """Download audio and transcribe with Whisper."""
     if not quiet:
         backend = "faster-whisper" if HAS_FASTER_WHISPER else "openai-whisper CLI"
-        print(f"→ Using Whisper transcription ({backend})...")
+        features = []
+        if diarize:
+            features.append("speaker diarization")
+        feature_str = f" + {', '.join(features)}" if features else ""
+        print(f"→ Using Whisper transcription ({backend}{feature_str})...")
 
     audio_file = f"{output_file}.audio.mp3"
 
@@ -522,8 +686,10 @@ def transcribe_with_whisper(url, output_file, model='base', language=None,
 
         if HAS_FASTER_WHISPER:
             # Use faster-whisper (Python API, much faster)
+            hf_token = get_hf_token() if diarize else None
             transcribe_with_faster_whisper(audio_file, output_file, model, language,
-                                           output_format, quiet)
+                                           output_format, quiet, diarize, num_speakers,
+                                           hf_token)
         else:
             # Fall back to openai-whisper CLI
             transcribe_audio_with_progress(audio_file, output_file, model, language,
@@ -667,8 +833,12 @@ def process_url(url, args):
         return True
 
     # Fall back to Whisper
+    diarize = getattr(args, 'diarize', False)
+    num_speakers = getattr(args, 'num_speakers', None)
+    
     if transcribe_with_whisper(url, output_base, args.model, args.language,
-                               args.format, args.keep_audio, args.quiet, cookies):
+                               args.format, args.keep_audio, args.quiet, cookies,
+                               diarize, num_speakers):
         output_files = []
         if args.format == 'all':
             for ext in ['txt', 'srt', 'vtt', 'json', 'tsv']:
@@ -773,7 +943,47 @@ Examples:
                        action='store_true',
                        help='Skip native captions and always use Whisper')
 
+    parser.add_argument('--diarize', '-d',
+                       action='store_true',
+                       help='Enable speaker diarization (who said what). Requires pyannote-audio and HF token.')
+
+    parser.add_argument('--num-speakers',
+                       type=int,
+                       help='Number of speakers (helps diarization accuracy). Auto-detect if not set.')
+
     args = parser.parse_args()
+    
+    # Check diarization requirements
+    if args.diarize:
+        if not HAS_PYANNOTE:
+            print("✗ Speaker diarization requires pyannote-audio.")
+            print("")
+            print("Install with:")
+            print("  pip install pyannote-audio")
+            print("")
+            print("You'll also need a HuggingFace token:")
+            print("  1. Create token at https://huggingface.co/settings/tokens")
+            print("  2. Accept license at https://huggingface.co/pyannote/speaker-diarization-3.1")
+            print("  3. Set HF_TOKEN env var or run: huggingface-cli login")
+            sys.exit(1)
+        
+        if not HAS_FASTER_WHISPER:
+            print("✗ Speaker diarization requires faster-whisper (not openai-whisper CLI).")
+            print("")
+            print("Install with:")
+            print("  pip install faster-whisper")
+            sys.exit(1)
+        
+        hf_token = get_hf_token()
+        if not hf_token:
+            print("✗ Speaker diarization requires a HuggingFace token.")
+            print("")
+            print("Setup:")
+            print("  1. Create token at https://huggingface.co/settings/tokens")
+            print("  2. Accept license at https://huggingface.co/pyannote/speaker-diarization-3.1")
+            print("  3. Set HF_TOKEN environment variable")
+            print("     OR run: huggingface-cli login")
+            sys.exit(1)
     
     # Handle cache clearing
     if args.clear_cache:

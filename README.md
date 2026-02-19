@@ -6,6 +6,7 @@ Quick command-line tool to transcribe YouTube, TikTok, and Twitch videos to text
 
 - **Multi-platform support**: YouTube, TikTok, and Twitch (VODs and clips)
 - **Automatic source selection**: Tries native captions first (YouTube), falls back to Whisper AI
+- **Speaker diarization**: Identify who said what (requires pyannote-audio)
 - **Multiple output formats**: TXT, SRT, VTT, JSON, or all formats at once
 - **Whisper model selection**: Choose from tiny, base, small, medium, or large models
 - **Language support**: Auto-detect or specify language (en, es, fr, etc.)
@@ -99,6 +100,56 @@ trans -l en "URL"    # English
 trans -l es "URL"    # Spanish
 trans -l fr "URL"    # French
 trans -l ja "URL"    # Japanese
+```
+
+### Speaker Diarization
+
+Identify different speakers in the transcript (who said what):
+
+```bash
+# Enable speaker diarization
+trans --diarize "https://youtube.com/watch?v=..."
+
+# Specify number of speakers (improves accuracy)
+trans --diarize --num-speakers 2 "URL"
+
+# Diarization with subtitles
+trans -d -f srt "URL"
+```
+
+**Output example (txt):**
+```
+[Speaker 1]
+Hello and welcome to the show.
+Today we have a special guest.
+
+[Speaker 2]
+Thanks for having me!
+I'm excited to be here.
+```
+
+**Output example (srt/vtt):**
+```
+1
+00:00:00,000 --> 00:00:03,500
+[Speaker 1] Hello and welcome to the show.
+```
+
+**Requirements:**
+- `pyannote-audio` package: `pip install pyannote-audio`
+- HuggingFace token (free): https://huggingface.co/settings/tokens
+- Accept model license: https://huggingface.co/pyannote/speaker-diarization-3.1
+
+**Setup:**
+```bash
+# Install pyannote-audio
+pip install pyannote-audio
+
+# Login to HuggingFace (stores token)
+huggingface-cli login
+
+# Or set environment variable
+export HF_TOKEN=hf_your_token_here
 ```
 
 ### Advanced Options
@@ -209,6 +260,8 @@ options:
   -k, --keep-audio      Keep downloaded audio file
   -t, --timestamp       Add timestamp to filename
   -q, --quiet           Minimal output (errors only)
+  -d, --diarize         Enable speaker diarization (who said what)
+  --num-speakers N      Number of speakers (helps diarization accuracy)
   --cookies PATH        Path to cookies.txt file (for TikTok, etc.)
   --force-whisper       Skip native captions, always use Whisper
 ```
@@ -248,6 +301,8 @@ The tool automatically uses browser impersonation (Chrome) when accessing TikTok
 5. **Accuracy matters**: Use `-m medium` or `-m large`
 6. **Scripting**: Use `-q` for clean output in scripts
 7. **Clipboard workflow**: Use `-c -q` for copy-paste workflow
+8. **Podcasts/interviews**: Use `-d` (diarize) to identify speakers
+9. **Known speakers**: Use `--num-speakers N` for better diarization
 
 ## Troubleshooting
 
