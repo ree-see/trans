@@ -1,9 +1,10 @@
 # Trans - Video Transcription Tool
 
-Quick command-line tool to transcribe YouTube, TikTok, and Twitch videos to text.
+Quick command-line tool to transcribe videos and audio files to text.
 
 ## Features
 
+- **Local file support**: Transcribe audio (mp3, wav, m4a, flac, etc.) and video (mp4, mkv, avi, etc.) files directly
 - **Multi-platform support**: YouTube, TikTok, and Twitch (VODs and clips)
 - **Automatic source selection**: Tries native captions first (YouTube), falls back to Whisper AI
 - **Speaker diarization**: Identify who said what (requires pyannote-audio)
@@ -64,7 +65,27 @@ sudo dnf install ffmpeg
 
 ## Usage
 
-### Basic Usage
+### Local Files
+
+```bash
+# Audio files
+trans recording.mp3
+trans interview.wav
+trans ~/Downloads/podcast.m4a
+
+# Video files (auto-extracts audio)
+trans meeting.mp4
+trans lecture.mkv
+trans ~/Videos/interview.mov
+
+# With speaker identification
+trans --diarize meeting.mp4
+
+# Higher quality model
+trans --model medium conference_talk.mp3
+```
+
+### URLs
 
 ```bash
 # Simple transcription (auto-named from video title)
@@ -326,17 +347,27 @@ TikTok aggressively blocks datacenter/VPS IP addresses. If you see "IP address i
 
 The tool automatically uses browser impersonation (Chrome) when accessing TikTok, but IP-level blocks still apply.
 
+## Supported File Formats
+
+### Audio
+- mp3, wav, m4a, flac, ogg, opus, aac, wma
+
+### Video (audio auto-extracted)
+- mp4, mkv, avi, mov, webm, flv, wmv, m4v, mpeg, mpg
+
 ## Tips
 
-1. **YouTube videos**: Usually have native captions (faster)
-2. **TikTok videos**: Always use Whisper (more accurate for short clips)
-3. **Twitch VODs**: Use smaller models for long streams
-4. **Long videos**: Use `-m tiny` or `-m base` for speed
-5. **Accuracy matters**: Use `-m medium` or `-m large`
-6. **Scripting**: Use `-q` for clean output in scripts
-7. **Clipboard workflow**: Use `-c -q` for copy-paste workflow
-8. **Podcasts/interviews**: Use `-d` (diarize) to identify speakers
-9. **Known speakers**: Use `--num-speakers N` for better diarization
+1. **Local files**: No network needed, works offline
+2. **Video files**: Audio is automatically extracted using ffmpeg
+3. **YouTube videos**: Usually have native captions (faster)
+4. **TikTok videos**: Always use Whisper (more accurate for short clips)
+5. **Twitch VODs**: Use smaller models for long streams
+6. **Long videos**: Use `-m tiny` or `-m base` for speed
+7. **Accuracy matters**: Use `-m medium` or `-m large`
+8. **Scripting**: Use `-q` for clean output in scripts
+9. **Clipboard workflow**: Use `-c -q` for copy-paste workflow
+10. **Podcasts/interviews**: Use `-d` (diarize) to identify speakers
+11. **Known speakers**: Use `--num-speakers N` for better diarization
 
 ## Troubleshooting
 

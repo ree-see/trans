@@ -73,6 +73,11 @@ WHISPER_MODELS = ['tiny', 'base', 'small', 'medium', 'large']
 # Supported output formats
 OUTPUT_FORMATS = ['txt', 'srt', 'vtt', 'json', 'all']
 
+# Supported local file extensions
+AUDIO_EXTENSIONS = {'.mp3', '.wav', '.m4a', '.flac', '.ogg', '.opus', '.aac', '.wma'}
+VIDEO_EXTENSIONS = {'.mp4', '.mkv', '.avi', '.mov', '.webm', '.flv', '.wmv', '.m4v', '.mpeg', '.mpg'}
+MEDIA_EXTENSIONS = AUDIO_EXTENSIONS | VIDEO_EXTENSIONS
+
 
 # ============== Cache Functions ==============
 
@@ -176,6 +181,75 @@ def is_tiktok_url(url):
 def is_twitch_url(url):
     """Check if URL is a Twitch video (VOD, clip, or stream)."""
     return 'twitch.tv' in url
+
+
+def is_local_file(path):
+    """Check if input is a local file path (not a URL)."""
+    # URLs start with http(s):// or have known domains
+    if path.startswith(('http://', 'https://')):
+        return False
+    if any(domain in path for domain in ['youtube.com', 'youtu.be', 'tiktok.com', 'twitch.tv']):
+        return False
+    # Check if it's a file with a supported extension
+    path_obj = Path(path)
+    return path_obj.suffix.lower() in MEDIA_EXTENSIONS
+
+
+def is_audio_file(path):
+    """Check if file is an audio file (vs video)."""
+    return Path(path).suffix.lower() in AUDIO_EXTENSIONS
+
+
+def get_file_info(filepath, quiet=False):
+    """Get local file information using ffprobe."""
+    filepath = Path(filepath)
+    if not filepath.exists():
+        if not quiet:
+            print(f"✗ File not found: {filepath}")
+        sys.exit(1)
+    
+    # Get duration using ffprobe
+    duration = 0
+    try:
+        result = subprocess.run(
+            ['ffprobe', '-v', 'error', '-show_entries', 'format=duration',
+             '-of', 'default=noprint_wrappers=1:nokey=1', str(filepath)],
+            capture_output=True, text=True
+        )
+        if result.stdout.strip():
+            duration = float(result.stdout.strip())
+    except (subprocess.CalledProcessError, ValueError):
+        pass  # Duration will stay 0
+    
+    return {
+        'title': filepath.stem,
+        'duration': duration,
+        'path': str(filepath.absolute()),
+        'is_audio': is_audio_file(filepath)
+    }
+
+
+def extract_audio_from_video(video_path, output_audio, quiet=False):
+    """Extract audio from video file using ffmpeg."""
+    if not quiet:
+        print(f"→ Extracting audio from video...")
+    
+    cmd = [
+        'ffmpeg', '-y',  # Overwrite without asking
+        '-i', str(video_path),
+        '-vn',  # No video
+        '-acodec', 'libmp3lame',
+        '-q:a', '2',  # High quality
+        str(output_audio)
+    ]
+    
+    try:
+        subprocess.run(cmd, capture_output=True, check=True)
+        return True
+    except subprocess.CalledProcessError as e:
+        if not quiet:
+            print(f"✗ Failed to extract audio: {e.stderr.decode() if e.stderr else str(e)}")
+        return False
 
 
 def download_audio_with_progress(url, output_file, cookies=None, quiet=False):
@@ -749,6 +823,139 @@ def transcribe_with_whisper(url, output_file, model='base', language=None,
         return False
 
 
+def transcribe_local_audio(audio_file, output_file, model='base', language=None,
+                           output_format='txt', quiet=False, diarize=False,
+                           num_speakers=None):
+    """Transcribe a local audio file with Whisper."""
+    if not quiet:
+        backend = "faster-whisper" if HAS_FASTER_WHISPER else "openai-whisper CLI"
+        features = []
+        if diarize:
+            features.append("speaker diarization")
+        feature_str = f" + {', '.join(features)}" if features else ""
+        print(f"→ Using Whisper transcription ({backend}{feature_str})...")
+        print(f"→ Transcribing with Whisper ({model} model)...")
+
+    try:
+        if HAS_FASTER_WHISPER:
+            # Use faster-whisper (Python API, much faster)
+            hf_token = get_hf_token() if diarize else None
+            transcribe_with_faster_whisper(audio_file, output_file, model, language,
+                                           output_format, quiet, diarize, num_speakers,
+                                           hf_token)
+        else:
+            # Fall back to openai-whisper CLI
+            transcribe_audio_with_progress(audio_file, output_file, model, language,
+                                           output_format, quiet)
+
+            # Whisper CLI creates files with format: {audio_file_without_ext}.{format}
+            base_name = os.path.splitext(audio_file)[0]
+
+            # Move output files to desired location
+            formats_to_move = [output_format] if output_format != 'all' else ['txt', 'srt', 'vtt', 'json', 'tsv']
+
+            for fmt in formats_to_move:
+                whisper_output = f"{base_name}.{fmt}"
+                final_output = f"{output_file}.{fmt}"
+
+                if os.path.exists(whisper_output) and whisper_output != final_output:
+                    os.rename(whisper_output, final_output)
+
+        return True
+
+    except Exception as e:
+        if not quiet:
+            print(f"✗ Error during transcription: {e}")
+        return False
+
+
+def process_file(filepath, args):
+    """Process a local audio/video file."""
+    filepath = Path(filepath)
+    
+    # Get file info
+    info = get_file_info(filepath, args.quiet)
+    file_title = info['title']
+    duration = info['duration']
+    is_audio = info['is_audio']
+    
+    # Determine output filename
+    if args.output:
+        output_base = args.output
+    else:
+        safe_title = sanitize_filename(file_title)
+        if args.timestamp:
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            output_base = f"{safe_title}_{timestamp}"
+        else:
+            output_base = safe_title
+    
+    if not args.quiet:
+        print(f"\n{'='*60}")
+        print(f"📁 {filepath.name}")
+        if duration:
+            mins, secs = divmod(duration, 60)
+            hours = mins // 60
+            mins = mins % 60
+            if hours > 0:
+                print(f"⏱️  Duration: {int(hours)}:{int(mins):02d}:{int(secs):02d}")
+            else:
+                print(f"⏱️  Duration: {int(mins)}:{int(secs):02d}")
+        print(f"{'='*60}\n")
+    
+    diarize = getattr(args, 'diarize', False)
+    num_speakers = getattr(args, 'num_speakers', None)
+    
+    # For video files, extract audio first
+    temp_audio = None
+    if not is_audio:
+        temp_audio = f"{output_base}.temp_audio.mp3"
+        if not extract_audio_from_video(filepath, temp_audio, args.quiet):
+            return False
+        audio_file = temp_audio
+    else:
+        audio_file = str(filepath)
+    
+    # Transcribe
+    success = transcribe_local_audio(
+        audio_file, output_base, args.model, args.language,
+        args.format, args.quiet, diarize, num_speakers
+    )
+    
+    # Clean up temp audio if created
+    if temp_audio and os.path.exists(temp_audio):
+        os.remove(temp_audio)
+    
+    if success:
+        output_files = []
+        if args.format == 'all':
+            for ext in ['txt', 'srt', 'vtt', 'json', 'tsv']:
+                if os.path.exists(f"{output_base}.{ext}"):
+                    output_files.append(f"{output_base}.{ext}")
+        else:
+            output_files = [f"{output_base}.{args.format}"]
+        
+        if not args.quiet:
+            print(f"\n✓ Transcription complete")
+            for f in output_files:
+                if os.path.exists(f):
+                    size = os.path.getsize(f)
+                    print(f"  → {f} ({size} bytes)")
+        
+        # Copy to clipboard if requested
+        if args.clipboard and os.path.exists(f"{output_base}.txt"):
+            with open(f"{output_base}.txt", 'r') as f:
+                if copy_to_clipboard(f.read()):
+                    if not args.quiet:
+                        print(f"📋 Copied to clipboard")
+        
+        return True
+    
+    if not args.quiet:
+        print("✗ Transcription failed")
+    return False
+
+
 def process_url(url, args):
     """Process a single URL."""
     # Get video ID for caching
@@ -896,22 +1103,35 @@ def process_url(url, args):
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Transcribe YouTube, TikTok, or Twitch videos to text.',
+        description='Transcribe videos and audio files to text.',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
+  # URLs
   trans "https://youtube.com/watch?v=..."
   trans -o my_video "https://tiktok.com/..."
   trans "https://twitch.tv/videos/123456789"  # Twitch VOD
   trans "https://clips.twitch.tv/FunnyClipName"  # Twitch clip
-  trans --model small --format srt "https://youtube.com/..."
-  trans --clipboard --quiet "https://youtube.com/..."
-  trans "url1" "url2" "url3"  # Batch processing
+
+  # Local files
+  trans recording.mp3                         # Audio file
+  trans interview.mp4                         # Video file  
+  trans ~/Downloads/podcast.m4a               # Full path
+  trans --diarize meeting.mp4                 # With speaker ID
+
+  # Options
+  trans --model small --format srt "video.mp4"
+  trans --clipboard --quiet "audio.mp3"
+  trans file1.mp3 file2.mp4 "url"             # Batch processing
+
+Supported formats:
+  Audio: mp3, wav, m4a, flac, ogg, opus, aac, wma
+  Video: mp4, mkv, avi, mov, webm, flv, wmv, m4v, mpeg, mpg
         """
     )
 
-    parser.add_argument('urls', nargs='+', metavar='URL',
-                       help='YouTube, TikTok, or Twitch video URL(s)')
+    parser.add_argument('inputs', nargs='+', metavar='INPUT',
+                       help='Video/audio URL(s) or local file path(s)')
 
     parser.add_argument('-o', '--output',
                        help='Output file path (without extension). Only for single URL.')
@@ -1012,20 +1232,27 @@ Examples:
         sys.exit(0)
 
     # Validate arguments
-    if args.output and len(args.urls) > 1:
-        print("✗ Error: -o/--output can only be used with a single URL")
+    if args.output and len(args.inputs) > 1:
+        print("✗ Error: -o/--output can only be used with a single input")
         sys.exit(1)
 
-    # Process URLs
+    # Process inputs (URLs and local files)
     success_count = 0
     fail_count = 0
 
-    for url in args.urls:
+    for input_path in args.inputs:
         try:
-            if process_url(url, args):
-                success_count += 1
+            # Detect if this is a local file or a URL
+            if is_local_file(input_path):
+                if process_file(input_path, args):
+                    success_count += 1
+                else:
+                    fail_count += 1
             else:
-                fail_count += 1
+                if process_url(input_path, args):
+                    success_count += 1
+                else:
+                    fail_count += 1
         except KeyboardInterrupt:
             print("\n\n⚠️  Interrupted by user")
             sys.exit(1)
@@ -1035,7 +1262,7 @@ Examples:
             fail_count += 1
 
     # Summary for batch processing
-    if len(args.urls) > 1 and not args.quiet:
+    if len(args.inputs) > 1 and not args.quiet:
         print(f"\n{'='*60}")
         print(f"Summary: {success_count} succeeded, {fail_count} failed")
         print(f"{'='*60}")
