@@ -369,6 +369,34 @@ The tool automatically uses browser impersonation (Chrome) when accessing TikTok
 10. **Podcasts/interviews**: Use `-d` (diarize) to identify speakers
 11. **Known speakers**: Use `--num-speakers N` for better diarization
 
+## Development
+
+### Running Tests
+
+The project includes a comprehensive test suite (52 tests) covering:
+
+```bash
+# Run all tests
+pytest test_trans.py
+
+# Run with verbose output
+pytest -v test_trans.py
+
+# Run specific test categories
+pytest -k "test_url" test_trans.py     # URL parsing tests
+pytest -k "test_filename" test_trans.py # Filename tests
+```
+
+**Test coverage:**
+- URL parsing (YouTube, TikTok, Twitch, hash fallback)
+- Filename sanitization (special chars, length limits)
+- URL detection and local file classification
+- Timestamp formatting (SRT vs VTT)
+- Speaker diarization processing
+- Extension validation
+
+All tests run offline with no network dependencies.
+
 ## Troubleshooting
 
 ### "No such file or directory: 'yt-dlp'"
