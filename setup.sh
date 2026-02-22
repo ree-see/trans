@@ -1,13 +1,14 @@
 #!/bin/bash
-# Quick setup script for transcribe tool
+# Quick setup script for trans CLI
+
+set -e
 
 echo "Installing Python dependencies..."
-uv pip install -r requirements.txt
+uv pip install -e ".[all]"
 
 echo ""
 echo "Setup complete!"
 echo ""
-echo "Usage: ./transcribe \"https://www.youtube.com/watch?v=VIDEO_ID\""
+echo "Usage: trans \"https://www.youtube.com/watch?v=VIDEO_ID\""
 echo ""
-echo "Optional: Add to PATH by adding this to ~/.zshrc:"
-echo "export PATH=\"\$PATH:$(pwd)\""
+echo "Or run directly: python trans_cli.py <url>"
