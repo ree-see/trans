@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-"""Unit tests for trans_cli.py"""
+"""Unit tests for trans package."""
 
 import pytest
 import tempfile
 import os
 from pathlib import Path
 
-# Import functions from trans_cli
-from trans_cli import (
+# Import functions from trans.utils
+from trans.utils import (
     get_video_id,
     sanitize_filename,
     is_tiktok_url,
