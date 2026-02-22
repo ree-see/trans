@@ -3,7 +3,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "trnscrb"
+name = "boswell"
 version = "0.4.0"
 description = "Transcribe YouTube, TikTok, and Twitch videos to text with speaker diarization"
 readme = "README.md"
