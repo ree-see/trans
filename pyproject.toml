@@ -79,7 +79,8 @@ Repository = "https://github.com/ree-see/trans"
 Issues = "https://github.com/ree-see/trans/issues"
 
 [tool.hatch.build.targets.wheel]
-packages = ["."]
+# Single-file module - include directly, not as package
+include = ["trans_cli.py"]
 
 [tool.hatch.build.targets.sdist]
 include = [
