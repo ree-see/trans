@@ -24,10 +24,10 @@ Quick command-line tool to transcribe videos and audio files to text.
 
 ```bash
 # Basic installation
-pip install trans-cli
+pip install boswell
 
 # With speaker diarization support
-pip install trans-cli[diarize]
+pip install boswell[diarize]
 ```
 
 ### From source
