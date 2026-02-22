@@ -4,6 +4,8 @@ Quick transcribe tool for YouTube, TikTok, and Twitch videos.
 Tries native captions first, falls back to Whisper transcription.
 """
 
+__version__ = "0.3.0"
+
 import argparse
 import os
 import sys
@@ -1129,6 +1131,10 @@ Supported formats:
   Video: mp4, mkv, avi, mov, webm, flv, wmv, m4v, mpeg, mpg
         """
     )
+
+    parser.add_argument('-V', '--version',
+                       action='version',
+                       version=f'%(prog)s {__version__}')
 
     parser.add_argument('inputs', nargs='+', metavar='INPUT',
                        help='Video/audio URL(s) or local file path(s)')
