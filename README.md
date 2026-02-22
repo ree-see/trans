@@ -35,10 +35,10 @@ pip install boswell[diarize]
 ```bash
 git clone https://github.com/ree-see/trans.git
 cd trans
-pip install -e .
+uv pip install -e .
 
-# With optional features
-pip install -e ".[diarize]"
+# With speaker diarization
+uv pip install -e ".[diarize]"
 ```
 
 ### Requirements
