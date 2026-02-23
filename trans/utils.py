@@ -1,8 +1,11 @@
 """Pure utility functions and constants for trans."""
 
+from __future__ import annotations
+
 import hashlib
 import re
 from pathlib import Path
+from typing import Any
 
 # Supported Whisper models
 WHISPER_MODELS = ['tiny', 'base', 'small', 'medium', 'large']
@@ -105,8 +108,8 @@ def format_speaker_label(speaker_id: str) -> str:
 
 
 def assign_speakers_to_segments(
-    transcript_segments: list, diarization_segments: list
-) -> list:
+    transcript_segments: list[dict[str, Any]], diarization_segments: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
     """
     Merge transcript segments with speaker labels from diarization.
 
@@ -116,7 +119,7 @@ def assign_speakers_to_segments(
     for t_seg in transcript_segments:
         t_start, t_end = t_seg['start'], t_seg['end']
 
-        speaker_overlaps: dict = {}
+        speaker_overlaps: dict[str, float] = {}
         for d_seg in diarization_segments:
             d_start, d_end = d_seg['start'], d_seg['end']
 

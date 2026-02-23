@@ -1,16 +1,19 @@
 """Output file writing for transcript segments."""
 
+from __future__ import annotations
+
 import json
 from pathlib import Path
+from typing import Any
 
 from .utils import format_speaker_label, format_timestamp_srt, format_timestamp_vtt
 
 
 def write_output(
-    segments: list[dict],
+    segments: list[dict[str, Any]],
     output_base: str,
     fmt: str,
-    info: dict | None = None,
+    info: dict[str, Any] | None = None,
     diarized: bool = False,
 ) -> list[Path]:
     """
@@ -78,7 +81,7 @@ def write_output(
     if fmt in ('json', 'all'):
         path = Path(f"{output_base}.json")
         with open(path, 'w', encoding='utf-8') as f:
-            output_data: dict = {
+            output_data: dict[str, Any] = {
                 'diarization': has_speakers,
                 'segments': segments,
             }

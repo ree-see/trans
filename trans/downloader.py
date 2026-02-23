@@ -1,17 +1,20 @@
 """yt-dlp Python API wrapper for downloading and caption extraction."""
 
+from __future__ import annotations
+
 import os
 import re
 import sys
 from pathlib import Path
+from typing import Any, Callable
 
 import yt_dlp
 
 from .utils import is_tiktok_url
 
 
-def _base_opts(url: str, cookies: str | None, quiet: bool) -> dict:
-    opts: dict = {'quiet': quiet, 'no_warnings': quiet}
+def _base_opts(url: str, cookies: str | None, quiet: bool) -> dict[str, Any]:
+    opts: dict[str, Any] = {'quiet': quiet, 'no_warnings': quiet}
     if is_tiktok_url(url):
         opts['impersonate'] = 'chrome-131'
     if cookies:
@@ -19,7 +22,7 @@ def _base_opts(url: str, cookies: str | None, quiet: bool) -> dict:
     return opts
 
 
-def get_video_info(url: str, cookies: str | None = None, quiet: bool = False) -> dict:
+def get_video_info(url: str, cookies: str | None = None, quiet: bool = False) -> dict[str, Any]:
     """Fetch video metadata without downloading."""
     opts = _base_opts(url, cookies, quiet)
     try:
@@ -50,7 +53,7 @@ def download_audio(
     output_path: str,
     cookies: str | None = None,
     quiet: bool = False,
-    progress_callback=None,
+    progress_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> str:
     """Download audio from URL. Returns the final file path."""
     opts = _base_opts(url, cookies, quiet)

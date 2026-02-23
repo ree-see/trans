@@ -1,14 +1,18 @@
 """Whisper transcription engine with model reuse across batch runs."""
 
+from __future__ import annotations
+
 import subprocess
 import sys
 from pathlib import Path
+from typing import Any
 
 try:
     from faster_whisper import WhisperModel
     HAS_FASTER_WHISPER = True
 except ImportError:
     HAS_FASTER_WHISPER = False
+    WhisperModel = None  # type: ignore[misc, assignment]
 
 
 def get_file_duration(audio_file: str) -> float:
@@ -58,12 +62,12 @@ def extract_audio_from_video(video_path: str, output_audio: str, quiet: bool = F
 class TranscriptionEngine:
     """Lazy-loading Whisper model, reused across multiple transcriptions."""
 
-    def __init__(self, model_name: str = 'base'):
+    def __init__(self, model_name: str = 'base') -> None:
         self.model_name = model_name
-        self._model = None
+        self._model: WhisperModel | None = None
 
     @property
-    def model(self):
+    def model(self) -> WhisperModel:
         if self._model is None:
             if not HAS_FASTER_WHISPER:
                 raise ImportError(
@@ -77,7 +81,7 @@ class TranscriptionEngine:
         audio_file: str,
         language: str | None = None,
         quiet: bool = False,
-    ) -> tuple[list[dict], dict]:
+    ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
         """
         Transcribe audio file.
 
@@ -99,7 +103,7 @@ class TranscriptionEngine:
             vad_filter=False,
         )
 
-        segments_list: list[dict] = []
+        segments_list: list[dict[str, Any]] = []
         last_percent = 0
 
         for segment in segments_gen:

@@ -1,7 +1,10 @@
 """Speaker diarization via pyannote-audio."""
 
+from __future__ import annotations
+
 import os
 from pathlib import Path
+from typing import Any
 
 from .utils import assign_speakers_to_segments
 
@@ -30,7 +33,7 @@ def run_diarization(
     hf_token: str,
     num_speakers: int | None = None,
     quiet: bool = False,
-) -> list[dict]:
+) -> list[dict[str, Any]]:
     """
     Run speaker diarization using pyannote-audio.
 

@@ -1,7 +1,10 @@
 """SQLite transcript cache with TTL support."""
 
+from __future__ import annotations
+
 import sqlite3
 from pathlib import Path
+from typing import Any
 
 from platformdirs import user_cache_dir
 
@@ -33,10 +36,10 @@ def _init_db(db_path: Path) -> None:
 
 
 class CacheManager:
-    def __init__(self, db_path: Path | None = None):
+    def __init__(self, db_path: Path | None = None) -> None:
         self._db = db_path or _cache_db()
 
-    def get(self, video_id: str, fmt: str = 'txt', ttl_days: int = 30) -> tuple | None:
+    def get(self, video_id: str, fmt: str = 'txt', ttl_days: int = 30) -> tuple[str, str] | None:
         """Return (transcript, title) if cached and within TTL, else None."""
         if not self._db.exists():
             return None
@@ -83,7 +86,7 @@ class CacheManager:
         conn.close()
         return count
 
-    def stats(self) -> dict:
+    def stats(self) -> dict[str, Any]:
         """Return cache statistics."""
         if not self._db.exists():
             return {'count': 0, 'size_mb': 0.0, 'oldest': None, 'newest': None}
