@@ -30,6 +30,8 @@ pip install boswell
 pip install boswell[diarize]
 ```
 
+**Type checking support**: This package includes full type annotations and supports static type checking with mypy, pyright, and other PEP 561 compliant tools.
+
 ### From source
 
 ```bash
