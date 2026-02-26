@@ -141,6 +141,23 @@ trans transcribe -l fr "URL"   # French
 trans transcribe -l ja "URL"   # Japanese
 ```
 
+### Translation Mode
+
+Translate any language to English during transcription:
+
+```bash
+# Translate Spanish video to English
+trans transcribe --translate "https://youtube.com/watch?v=spanish_video"
+
+# Translate with speaker identification
+trans transcribe --translate --diarize "interview.mp4"
+
+# Translate and output as subtitles
+trans transcribe --translate -f srt "foreign_film.mp4"
+```
+
+**Note:** Translation uses Whisper's built-in translation capability (not a separate service). The source language is auto-detected. This works best for clear speech; heavily accented or noisy audio may affect quality.
+
 ### Speaker Diarization
 
 Identify different speakers in the transcript:
@@ -329,6 +346,7 @@ Options:
   --force-whisper          Skip native captions, always use Whisper
   -d, --diarize            Enable speaker diarization
   --num-speakers N         Number of speakers (helps diarization accuracy)
+  --translate              Translate non-English audio to English
 ```
 
 ## Twitch Notes

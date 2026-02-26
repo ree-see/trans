@@ -81,6 +81,7 @@ class TranscriptionEngine:
         audio_file: str,
         language: str | None = None,
         quiet: bool = False,
+        translate: bool = False,
     ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
         """
         Transcribe audio file.
@@ -96,9 +97,11 @@ class TranscriptionEngine:
         if not quiet:
             print("  Transcribing...")
 
+        task = "translate" if translate else "transcribe"
         segments_gen, info = self.model.transcribe(
             audio_file,
             language=language or None,
+            task=task,
             beam_size=5,
             vad_filter=False,
         )

@@ -125,6 +125,7 @@ def _process_url(
     force_whisper: bool,
     diarize: bool,
     num_speakers: int | None,
+    translate: bool,
     engine: TranscriptionEngine,
     cache: CacheManager,
     config: Config,
@@ -187,7 +188,7 @@ def _process_url(
             typer.echo("→ Downloading audio...")
         final_audio = download_audio(url, audio_file, cookies=cookies_str, quiet=quiet)
 
-        segments, info_dict = engine.transcribe(final_audio, language=language or None, quiet=quiet)
+        segments, info_dict = engine.transcribe(final_audio, language=language or None, quiet=quiet, translate=translate)
 
         if diarize:
             hf_token = get_hf_token()
@@ -252,6 +253,7 @@ def _process_local(
     quiet: bool,
     diarize: bool,
     num_speakers: int | None,
+    translate: bool,
     engine: TranscriptionEngine,
     config: Config,
 ) -> bool:
@@ -290,7 +292,7 @@ def _process_local(
         audio_file = temp_audio
 
     try:
-        segments, info_dict = engine.transcribe(audio_file, language=language or None, quiet=quiet)
+        segments, info_dict = engine.transcribe(audio_file, language=language or None, quiet=quiet, translate=translate)
 
         if diarize:
             hf_token = get_hf_token()
@@ -355,6 +357,7 @@ def transcribe(
     force_whisper: bool = typer.Option(False, "--force-whisper", help="Skip native captions, always use Whisper."),
     diarize: bool = typer.Option(False, "-d", "--diarize", help="Enable speaker diarization (requires pyannote-audio)."),
     num_speakers: int = typer.Option(None, "--num-speakers", help="Number of speakers (helps diarization accuracy)."),
+    translate: bool = typer.Option(False, "--translate", help="Translate non-English audio to English."),
 ) -> None:
     """Transcribe video/audio URLs or local files to text."""
 
@@ -442,6 +445,7 @@ def transcribe(
                     quiet=eff_quiet,
                     diarize=diarize,
                     num_speakers=num_speakers,
+                    translate=translate,
                     engine=engine,
                     config=cfg,
                 )
@@ -462,6 +466,7 @@ def transcribe(
                     force_whisper=force_whisper,
                     diarize=diarize,
                     num_speakers=num_speakers,
+                    translate=translate,
                     engine=engine,
                     cache=cache,
                     config=cfg,
