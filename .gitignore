@@ -48,3 +48,7 @@ dist/
 
 # Cache
 .cache/
+
+# Rust
+/target/
+**/*.rs.bk
