@@ -24,7 +24,6 @@ __pycache__/
 
 # Exceptions - keep README
 !README.md
-!requirements.txt
 
 # macOS
 .DS_Store

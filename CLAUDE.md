@@ -52,7 +52,8 @@ The entire tool lives in one file: `trans_cli.py` (~1200 lines). The flow is:
 
 ## Dependencies
 
-- **Runtime**: `yt-dlp`, `faster-whisper`, `tqdm`
-- **Optional**: `pyannote-audio` (diarization), `curl_cffi` (TikTok), `rich` (pretty output)
-- **System**: `ffmpeg` (required for audio extraction/video files), `ffprobe`
-- **Build**: `hatchling`
+- **Runtime (declared in `pyproject.toml`)**: `yt-dlp`, `faster-whisper`, `typer`, `pyperclip`, `platformdirs`, `tomli` (Python < 3.11 only).
+- **Optional**: `pyannote-audio` (`[diarize]`, speaker diarization), `curl_cffi` (`[tiktok]`, browser impersonation — TikTok degrades gracefully to a non-impersonated request when this is missing).
+- **Transitive**: `rich` is installed by `typer`; `trans` does not import it directly.
+- **System**: `ffmpeg` (required for audio extraction/video files), `ffprobe`.
+- **Build**: `hatchling`.

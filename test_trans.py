@@ -363,5 +363,27 @@ class TestDownloaderImpersonate:
         assert "backend not installed" in captured.out
 
 
+class TestPackageImports:
+    """Regression guards on the public package surface."""
+
+    def test_package_imports_cleanly(self):
+        """Every public submodule must remain importable in any env with the declared required deps."""
+        import importlib
+
+        import trans  # noqa: F401
+
+        for mod in (
+            "trans.cli",
+            "trans.config",
+            "trans.cache",
+            "trans.downloader",
+            "trans.transcriber",
+            "trans.utils",
+            "trans.diarizer",
+            "trans.formatter",
+        ):
+            importlib.import_module(mod)
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
