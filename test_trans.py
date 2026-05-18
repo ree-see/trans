@@ -22,6 +22,8 @@ from trans.utils import (
     VIDEO_EXTENSIONS,
     MEDIA_EXTENSIONS,
 )
+from trans.downloader import _base_opts
+from yt_dlp.networking.impersonate import ImpersonateTarget
 
 
 class TestGetVideoId:
@@ -280,7 +282,18 @@ class TestExtensionSets:
         assert AUDIO_EXTENSIONS == expected
 
     def test_video_extensions_complete(self):
-        expected = {".mp4", ".mkv", ".avi", ".mov", ".webm", ".flv", ".wmv", ".m4v", ".mpeg", ".mpg"}
+        expected = {
+            ".mp4",
+            ".mkv",
+            ".avi",
+            ".mov",
+            ".webm",
+            ".flv",
+            ".wmv",
+            ".m4v",
+            ".mpeg",
+            ".mpg",
+        }
         assert VIDEO_EXTENSIONS == expected
 
     def test_media_extensions_is_union(self):
@@ -289,6 +302,34 @@ class TestExtensionSets:
     def test_no_overlap_audio_video(self):
         # Audio and video extensions should be disjoint
         assert AUDIO_EXTENSIONS.isdisjoint(VIDEO_EXTENSIONS)
+
+
+class TestDownloaderImpersonate:
+    """Tests for _base_opts impersonation handling.
+
+    Regression guard for the yt-dlp >= 2024.07.01 API change: the
+    ``impersonate`` option must be an ``ImpersonateTarget`` instance,
+    not a raw string. A string here crashes with an empty-message
+    AssertionError inside yt-dlp's is_supported_target().
+    """
+
+    def test_tiktok_url_gets_impersonate_target(self):
+        opts = _base_opts(
+            "https://www.tiktok.com/@user/video/1234567890123456789",
+            cookies=None,
+            quiet=True,
+        )
+        assert "impersonate" in opts
+        assert isinstance(opts["impersonate"], ImpersonateTarget)
+        assert str(opts["impersonate"]) == "chrome-131"
+
+    def test_non_tiktok_url_has_no_impersonate(self):
+        opts = _base_opts(
+            "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+            cookies=None,
+            quiet=True,
+        )
+        assert "impersonate" not in opts
 
 
 if __name__ == "__main__":
