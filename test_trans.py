@@ -615,5 +615,318 @@ class TestPackageImports:
             importlib.import_module(mod)
 
 
+class TestCacheRoundTrip:
+    """Cache schema v2: store segments + info; render at hit time.
+
+    Validates the contract introduced by task-cache-format-contract — the cache
+    holds the canonical segment list for a video, not a rendered text blob.
+    """
+
+    @staticmethod
+    def _sample_segments():
+        return [
+            {"start": 0.0, "end": 2.5, "text": "Hello world"},
+            {"start": 2.5, "end": 5.0, "text": "Second segment"},
+        ]
+
+    @staticmethod
+    def _sample_info():
+        return {"language": "en", "language_probability": 0.99, "duration": 5.0}
+
+    def test_put_get_round_trip(self, tmp_path):
+        from trans.cache import CacheManager
+
+        cache = CacheManager(db_path=tmp_path / "c.db")
+        segs = self._sample_segments()
+        info = self._sample_info()
+        cache.put("yt_abc", "https://youtu.be/abc", "My Video", segs, info=info)
+        hit = cache.get("yt_abc", ttl_days=30)
+        assert hit is not None
+        assert hit.segments == segs
+        assert hit.info == info
+        assert hit.title == "My Video"
+        assert hit.source == "whisper"
+
+    def test_cache_hit_renders_all_formats(self, tmp_path):
+        from trans.cache import CacheManager
+        from trans.formatter import write_output
+
+        cache = CacheManager(db_path=tmp_path / "c.db")
+        segs = self._sample_segments()
+        cache.put("yt_abc", "url", "Title", segs, info=self._sample_info())
+        hit = cache.get("yt_abc", ttl_days=30)
+        base = str(tmp_path / "out")
+        write_output(hit.segments, base, "all", info=hit.info)
+        for ext in ("txt", "srt", "vtt", "json"):
+            p = Path(f"{base}.{ext}")
+            assert p.exists(), f"{ext} not written"
+            assert p.stat().st_size > 0
+
+    def test_cache_hit_renders_requested_format_only(self, tmp_path):
+        from trans.cache import CacheManager
+        from trans.formatter import write_output
+
+        cache = CacheManager(db_path=tmp_path / "c.db")
+        segs = self._sample_segments()
+        cache.put("yt_abc", "url", "Title", segs)
+        hit = cache.get("yt_abc", ttl_days=30)
+        base = str(tmp_path / "out")
+        write_output(hit.segments, base, "srt")
+        assert Path(f"{base}.srt").exists()
+        for ext in ("txt", "vtt", "json"):
+            assert not Path(f"{base}.{ext}").exists()
+
+    def test_cache_get_miss_returns_none(self, tmp_path):
+        from trans.cache import CacheManager
+
+        cache = CacheManager(db_path=tmp_path / "c.db")
+        assert cache.get("yt_nonexistent", ttl_days=30) is None
+
+    def test_cache_get_expired_returns_none(self, tmp_path):
+        import sqlite3
+
+        from trans.cache import CacheManager
+
+        db = tmp_path / "c.db"
+        cache = CacheManager(db_path=db)
+        cache.put("yt_old", "url", "Old", self._sample_segments())
+        # Backdate to outside TTL window
+        conn = sqlite3.connect(db)
+        conn.execute(
+            "UPDATE transcripts SET created_at = datetime('now', '-60 days') "
+            "WHERE video_id = 'yt_old'"
+        )
+        conn.commit()
+        conn.close()
+        assert cache.get("yt_old", ttl_days=30) is None
+
+    def test_cache_get_diarized_segments_preserved(self, tmp_path):
+        from trans.cache import CacheManager
+
+        cache = CacheManager(db_path=tmp_path / "c.db")
+        segs = [
+            {"start": 0.0, "end": 2.0, "text": "Hi", "speaker": "SPEAKER_00"},
+            {"start": 2.0, "end": 4.0, "text": "Hello", "speaker": "SPEAKER_01"},
+        ]
+        cache.put("yt_dia", "url", "Diarized", segs)
+        hit = cache.get("yt_dia", ttl_days=30)
+        assert hit.segments[0]["speaker"] == "SPEAKER_00"
+        assert hit.segments[1]["speaker"] == "SPEAKER_01"
+
+    def test_schema_mismatch_resets(self, tmp_path):
+        import sqlite3
+
+        from trans.cache import CacheManager
+
+        db = tmp_path / "c.db"
+        # Simulate old schema v1: transcript text column, user_version=1, one row
+        conn = sqlite3.connect(db)
+        conn.execute(
+            "CREATE TABLE transcripts ("
+            "video_id TEXT PRIMARY KEY, url TEXT, title TEXT, transcript TEXT, "
+            "format TEXT, model TEXT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)"
+        )
+        conn.execute(
+            "INSERT INTO transcripts (video_id, url, title, transcript, format) "
+            "VALUES ('yt_old', 'u', 't', 'text', 'txt')"
+        )
+        conn.execute("PRAGMA user_version = 1")
+        conn.commit()
+        conn.close()
+
+        cache = CacheManager(db_path=db)
+        # Touch a public method to trigger lazy schema-ensure
+        assert cache.get("yt_old", ttl_days=30) is None
+        # Verify new schema is in place
+        conn = sqlite3.connect(db)
+        version = conn.execute("PRAGMA user_version").fetchone()[0]
+        cols = [r[1] for r in conn.execute("PRAGMA table_info(transcripts)")]
+        conn.close()
+        assert version == 2
+        assert "segments_json" in cols
+        assert "transcript" not in cols
+
+    def test_schema_migration_from_unversioned_db(self, tmp_path):
+        """A DB file with no transcripts table and user_version=0 migrates cleanly.
+
+        Edge case: a previous trans crashed mid-init, or a user deleted the
+        transcripts table manually. The migration must tolerate the absence of
+        the table when computing the discarded-row count.
+        """
+        import sqlite3
+
+        from trans.cache import CacheManager
+
+        db = tmp_path / "c.db"
+        # Create the DB file but no transcripts table; user_version stays at 0.
+        conn = sqlite3.connect(db)
+        conn.execute("CREATE TABLE other (x INTEGER)")
+        conn.commit()
+        conn.close()
+
+        cache = CacheManager(db_path=db)
+        # First public call must not raise.
+        assert cache.get("yt_anything", ttl_days=30) is None
+        conn = sqlite3.connect(db)
+        version = conn.execute("PRAGMA user_version").fetchone()[0]
+        cols = [r[1] for r in conn.execute("PRAGMA table_info(transcripts)")]
+        conn.close()
+        assert version == 2
+        assert "segments_json" in cols
+
+    def test_put_with_none_info_round_trips(self, tmp_path):
+        from trans.cache import CacheManager
+
+        cache = CacheManager(db_path=tmp_path / "c.db")
+        cache.put("yt_noinfo", "url", "Title", self._sample_segments(), info=None)
+        hit = cache.get("yt_noinfo", ttl_days=30)
+        assert hit is not None
+        assert hit.info is None
+
+    def test_put_numpy_floats_serialize(self, tmp_path):
+        np = pytest.importorskip("numpy")
+        from trans.cache import CacheManager
+
+        cache = CacheManager(db_path=tmp_path / "c.db")
+        segs = [
+            {"start": np.float64(0.0), "end": np.float64(2.5), "text": "Hi"},
+        ]
+        info = {
+            "language": "en",
+            "language_probability": np.float32(0.99),
+            "duration": np.float64(5.0),
+        }
+        cache.put("yt_numpy", "url", "Title", segs, info=info)
+        hit = cache.get("yt_numpy", ttl_days=30)
+        assert isinstance(hit.segments[0]["start"], float)
+        assert isinstance(hit.segments[0]["end"], float)
+        assert isinstance(hit.info["language_probability"], float)
+        assert isinstance(hit.info["duration"], float)
+
+    def test_lazy_db_creation(self, tmp_path):
+        from trans.cache import CacheManager
+
+        db = tmp_path / "nope.db"
+        CacheManager(db_path=db)
+        assert not db.exists(), "constructing CacheManager must not touch the filesystem"
+
+    def test_native_captions_no_longer_cached(self, tmp_path, monkeypatch):
+        """Native-captions path must NOT write to the cache (post-contract behavior)."""
+        from trans import cli as cli_mod
+        from trans.cache import CacheManager
+        from trans.config import Config
+
+        # Stub the native-captions write so it returns success without network.
+        def fake_native(url, out_base, fmt, quiet):
+            Path(f"{out_base}.txt").write_text("captioned content", encoding="utf-8")
+            return True
+
+        monkeypatch.setattr(cli_mod, "extract_native_captions", fake_native)
+        monkeypatch.setattr(
+            cli_mod,
+            "get_video_info",
+            lambda url, cookies=None, quiet=False: {"title": "Native", "duration": 1},
+        )
+
+        class StubEngine:
+            def transcribe(self, *a, **kw):
+                raise AssertionError("native-captions path should short-circuit")
+
+        cache = CacheManager(db_path=tmp_path / "c.db")
+        cfg = Config()
+        url = "https://www.youtube.com/watch?v=fakefakefake"
+        ok = cli_mod._process_url(
+            url,
+            output=None,
+            output_dir=tmp_path,
+            model="base",
+            language=None,
+            fmt="txt",
+            clipboard=False,
+            keep_audio=False,
+            timestamp=False,
+            quiet=True,
+            cookies=None,
+            no_cache=False,
+            force_whisper=False,
+            diarize=False,
+            num_speakers=None,
+            translate=False,
+            engine=StubEngine(),
+            cache=cache,
+            config=cfg,
+        )
+        assert ok is True
+        # Critical assertion: native-captions success must not populate the cache
+        from trans.utils import get_video_id
+
+        assert cache.get(get_video_id(url), ttl_days=30) is None
+
+    def test_clipboard_copies_segments_text_on_cache_hit(self, tmp_path, monkeypatch):
+        """B-1 fix: -c on a cache hit copies plain-text join regardless of --format."""
+        from trans import cli as cli_mod
+        from trans.cache import CacheManager
+        from trans.config import Config
+
+        clipboard_calls: list[str] = []
+
+        def fake_copy(text: str, quiet: bool) -> None:
+            clipboard_calls.append(text)
+
+        monkeypatch.setattr(cli_mod, "_copy_to_clipboard", fake_copy)
+
+        cache = CacheManager(db_path=tmp_path / "c.db")
+        segs = [
+            {"start": 0.0, "end": 1.0, "text": "alpha"},
+            {"start": 1.0, "end": 2.0, "text": "beta"},
+        ]
+        url = "https://www.youtube.com/watch?v=fakefakefake"
+        from trans.utils import get_video_id
+
+        cache.put(get_video_id(url), url, "Title", segs)
+
+        class UnreachableEngine:
+            def transcribe(self, *a, **kw):
+                raise AssertionError("cache hit must short-circuit transcription")
+
+        ok = cli_mod._process_url(
+            url,
+            output=None,
+            output_dir=tmp_path,
+            model="base",
+            language=None,
+            fmt="srt",  # NOT txt — but clipboard must still receive plain text
+            clipboard=True,
+            keep_audio=False,
+            timestamp=False,
+            quiet=True,
+            cookies=None,
+            no_cache=False,
+            force_whisper=False,
+            diarize=False,
+            num_speakers=None,
+            translate=False,
+            engine=UnreachableEngine(),
+            cache=cache,
+            config=Config(),
+        )
+        assert ok is True
+        assert clipboard_calls == ["alpha\nbeta"]
+
+    def test_clipboard_diarized_keeps_speaker_headers(self, tmp_path):
+        """Diarized segments on a cache-hit clipboard should mirror the txt format,
+        i.e. include [Speaker N] headers rather than a flat join."""
+        from trans.cli import _segments_to_clipboard_text
+
+        segs = [
+            {"start": 0.0, "end": 1.0, "text": "hi", "speaker": "SPEAKER_00"},
+            {"start": 1.0, "end": 2.0, "text": "hello", "speaker": "SPEAKER_00"},
+            {"start": 2.0, "end": 3.0, "text": "world", "speaker": "SPEAKER_01"},
+        ]
+        text = _segments_to_clipboard_text(segs)
+        # Two speaker blocks separated by a blank line, same shape as formatter txt.
+        assert text == "[Speaker 1]\nhi\nhello\n\n[Speaker 2]\nworld"
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

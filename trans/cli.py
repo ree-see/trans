@@ -65,6 +65,31 @@ def _app_callback(
 # ---------------------------------------------------------------------------
 
 
+def _segments_to_clipboard_text(segments: list[dict]) -> str:
+    """Plain-text rendering of segments that mirrors formatter.write_output's txt
+    branch: `[Speaker N]` headers when segments carry speaker labels, otherwise
+    a flat newline-join. Keeps cache-hit and cache-miss clipboards identical
+    regardless of --format."""
+    if not segments:
+        return ""
+    from .utils import format_speaker_label
+
+    has_speakers = any("speaker" in s for s in segments)
+    if not has_speakers:
+        return "\n".join(s["text"] for s in segments)
+    lines: list[str] = []
+    current_speaker: str | None = None
+    for seg in segments:
+        speaker = format_speaker_label(seg.get("speaker", "UNKNOWN"))
+        if speaker != current_speaker:
+            if current_speaker is not None:
+                lines.append("")
+            lines.append(f"[{speaker}]")
+            current_speaker = speaker
+        lines.append(seg["text"])
+    return "\n".join(lines)
+
+
 def _copy_to_clipboard(text: str, quiet: bool) -> None:
     if not HAS_PYPERCLIP:
         if not quiet:
@@ -159,21 +184,23 @@ def _process_url(
     video_id = get_video_id(url)
     cookies_str = str(cookies) if cookies else None
 
-    # Cache lookup
+    # Cache lookup — schema v2 returns canonical segments; render at hit time.
     if not no_cache:
-        cached = cache.get(video_id, fmt if fmt != "all" else "txt", config.cache.ttl_days)
-        if cached:
-            transcript, title = cached
+        hit = cache.get(video_id, config.cache.ttl_days)
+        if hit:
             if not quiet:
-                typer.echo(f"\n💾 Using cached transcript for: {title}")
-            out_base = _output_base(title, output, output_dir, timestamp, config)
-            out_fmt = fmt if fmt != "all" else "txt"
-            out_file = f"{out_base}.{out_fmt}"
-            Path(out_file).write_text(transcript, encoding="utf-8")
+                typer.echo(f"\n💾 Using cached transcript for: {hit.title}")
+            out_base = _output_base(hit.title, output, output_dir, timestamp, config)
+            # any() instead of segments[0]: don't assume the first segment is
+            # representative — a future segment source could leave gaps.
+            diarized = any("speaker" in s for s in hit.segments)
+            created = write_output(hit.segments, out_base, fmt, info=hit.info, diarized=diarized)
             if not quiet:
-                typer.echo(f"✓ Transcript written to {out_file}")
+                for p in created:
+                    if p.exists():
+                        typer.echo(f"  → {p} ({p.stat().st_size} bytes)")
             if clipboard:
-                _copy_to_clipboard(transcript, quiet)
+                _copy_to_clipboard(_segments_to_clipboard_text(hit.segments), quiet)
             _discard_prefetched(prefetched, url, keep_audio)
             return True
 
@@ -191,17 +218,16 @@ def _process_url(
             typer.echo(f"⏱️  Duration: {int(mins)}:{int(secs):02d}")
         typer.echo(f"{'=' * 60}\n")
 
-    # Try native captions first
+    # Try native captions first.
+    # Note: native-captions hits are no longer cached. The cache holds canonical
+    # Whisper segments; native captions only produce a rendered .txt (or .vtt/.srt
+    # via yt-dlp). Caching them would require VTT->segments parsing, which is
+    # tracked as a follow-up task (task-cache-native-captions). For now,
+    # native-captions runs hit the network each time (~2s warm).
     if not force_whisper and extract_native_captions(url, out_base, fmt, quiet):
         if not quiet:
             typer.echo(f"\n✓ Transcription complete (native captions)")
             _print_output_files(out_base, fmt, ["txt", "vtt"])
-        if not no_cache:
-            txt_path = Path(f"{out_base}.txt")
-            if txt_path.exists():
-                cache.put(video_id, url, video_title, txt_path.read_text(encoding="utf-8"), "txt")
-                if not quiet:
-                    typer.echo("💾 Cached for future use")
         if clipboard:
             txt_path = Path(f"{out_base}.txt")
             if txt_path.exists():
@@ -264,18 +290,25 @@ def _process_url(
                     typer.echo(f"  → {p} ({p.stat().st_size} bytes)")
 
         if not no_cache:
-            txt_path = Path(f"{out_base}.txt")
-            if txt_path.exists():
+            # Cache write failures must never kill a successful transcription —
+            # the user already has their output files on disk.
+            try:
                 cache.put(
-                    video_id, url, video_title, txt_path.read_text(encoding="utf-8"), "txt", model
+                    video_id,
+                    url,
+                    video_title,
+                    segments,
+                    info=info_dict,
+                    model=model,
                 )
                 if not quiet:
                     typer.echo("💾 Cached for future use")
+            except Exception as e:
+                if not quiet:
+                    typer.echo(f"⚠️  Cache write failed: {e} (transcription succeeded)")
 
         if clipboard:
-            txt_path = Path(f"{out_base}.txt")
-            if txt_path.exists():
-                _copy_to_clipboard(txt_path.read_text(encoding="utf-8"), quiet)
+            _copy_to_clipboard(_segments_to_clipboard_text(segments), quiet)
 
         return True
 
@@ -495,11 +528,13 @@ def transcribe(
     downloaded: dict[str, str] = {}
     if len(urls) > 1:
         cookies_str = str(cookies) if cookies else None
-        cache_fmt = eff_format if eff_format != "all" else "txt"
         ttl = cfg.cache.ttl_days
 
         def _prefetch(url: str) -> tuple[str, str | None]:
-            if not no_cache and cache.get(get_video_id(url), cache_fmt, ttl):
+            # Schema v2: cache lookup no longer keys on format. A hit on any
+            # video_id means we have its segments and can render any format
+            # at hit time — so prefetch can skip download regardless of -f.
+            if not no_cache and cache.get(get_video_id(url), ttl):
                 return url, None
             # get_video_info / download_audio raise SystemExit on hard yt-dlp
             # errors (TikTok IP block, dead URL). Catch it here so one bad URL
