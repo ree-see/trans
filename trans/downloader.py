@@ -13,13 +13,46 @@ from yt_dlp.networking.impersonate import ImpersonateTarget
 
 from .utils import is_tiktok_url
 
+_BACKEND_HINT_SHOWN = False
+
+
+def _has_impersonate_backend() -> bool:
+    """Return True if an impersonation backend (curl_cffi) is importable.
+
+    yt-dlp's impersonation requires a registered handler; today the only
+    one shipped is CurlCFFI, which lives in the [tiktok] extra. If the
+    import fails we cannot impersonate, so the caller must omit the
+    'impersonate' option entirely rather than letting yt-dlp raise
+    "Impersonate target ... is not available" at download time.
+    """
+    try:
+        import curl_cffi  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
 
 def _base_opts(url: str, cookies: str | None, quiet: bool) -> dict[str, Any]:
+    global _BACKEND_HINT_SHOWN
     opts: dict[str, Any] = {"quiet": quiet, "no_warnings": quiet}
     if is_tiktok_url(url):
-        # yt-dlp >= 2024.07.01 requires an ImpersonateTarget instance here;
-        # passing a raw string crashes inside is_supported_target().
-        opts["impersonate"] = ImpersonateTarget.from_str("chrome-131")
+        if _has_impersonate_backend():
+            # yt-dlp >= 2024.07.01 requires an ImpersonateTarget instance here;
+            # passing a raw string crashes inside is_supported_target().
+            opts["impersonate"] = ImpersonateTarget.from_str("chrome-131")
+        elif not quiet and not _BACKEND_HINT_SHOWN:
+            # TikTok works without impersonation (just more bot-detectable),
+            # so degrade silently — but tell the user once how to fix it.
+            # Check-then-set is intentionally lock-free: under cli.py's
+            # ThreadPoolExecutor a batch of TikTok URLs without curl_cffi may
+            # race and print the hint up to N times. That's cosmetic, not
+            # incorrect; a lock here would be overkill for warning output.
+            print(
+                "Warning: TikTok impersonation backend not installed — "
+                "downloads may be blocked or rate-limited."
+            )
+            print("    Install with: pip install 'boswell[tiktok]'")
+            _BACKEND_HINT_SHOWN = True
     if cookies:
         opts["cookiefile"] = str(cookies)
     return opts

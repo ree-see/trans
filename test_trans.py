@@ -2,6 +2,7 @@
 """Unit tests for trans package."""
 
 import pytest
+import sys
 import tempfile
 import os
 from pathlib import Path
@@ -313,7 +314,10 @@ class TestDownloaderImpersonate:
     AssertionError inside yt-dlp's is_supported_target().
     """
 
-    def test_tiktok_url_gets_impersonate_target(self):
+    def test_tiktok_url_gets_impersonate_target(self, monkeypatch):
+        # Pin backend-present branch independent of install matrix
+        # (avoids test breaking under `pip install -e ".[dev]"` without [tiktok]).
+        monkeypatch.setitem(sys.modules, "curl_cffi", object())
         opts = _base_opts(
             "https://www.tiktok.com/@user/video/1234567890123456789",
             cookies=None,
@@ -330,6 +334,33 @@ class TestDownloaderImpersonate:
             quiet=True,
         )
         assert "impersonate" not in opts
+
+    def test_tiktok_without_backend_skips_impersonate(self, monkeypatch):
+        # When curl_cffi is missing, _base_opts must omit the 'impersonate'
+        # key so yt-dlp does not raise "Impersonate target ... is not available"
+        # at download time.
+        monkeypatch.setitem(sys.modules, "curl_cffi", None)
+        opts = _base_opts(
+            "https://www.tiktok.com/@user/video/1234567890123456789",
+            cookies=None,
+            quiet=True,
+        )
+        assert "impersonate" not in opts
+
+    def test_tiktok_without_backend_prints_hint(self, monkeypatch, capsys):
+        import trans.downloader
+
+        # Reset the once-per-process flag so the hint actually prints here.
+        monkeypatch.setattr(trans.downloader, "_BACKEND_HINT_SHOWN", False)
+        monkeypatch.setitem(sys.modules, "curl_cffi", None)
+        _base_opts(
+            "https://www.tiktok.com/@user/video/1234567890123456789",
+            cookies=None,
+            quiet=False,
+        )
+        captured = capsys.readouterr()
+        assert "boswell[tiktok]" in captured.out
+        assert "backend not installed" in captured.out
 
 
 if __name__ == "__main__":
