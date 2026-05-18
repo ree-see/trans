@@ -20,6 +20,9 @@ pytest test_trans.py           # all ~158 tests
 pytest -v test_trans.py        # verbose
 pytest -k "test_url" test_trans.py    # filter by name
 
+# Opt-in: real-world smoke tests (yt-dlp, Whisper). Slow + needs network.
+pytest --run-network test_trans.py
+
 # Lint / format
 ruff check trans/
 black trans/
@@ -62,6 +65,8 @@ Per-module map:
 ### Tested functions (offline, no network)
 
 Pure utility functions in `trans.utils` are unit-tested directly. The rest of the package is covered by integration tests in `test_trans.py` that monkeypatch yt-dlp / faster-whisper / pyperclip at the seam, so the suite runs offline.
+
+A small `TestTranscribeNetworkSmoke` block at the bottom of `test_trans.py` covers the Typer `transcribe` entry point end-to-end against real yt-dlp and faster-whisper. It is marked `@pytest.mark.network` and skipped unless `--run-network` is passed; the `conftest.py` at the repo root wires the flag.
 
 ## Dependencies
 

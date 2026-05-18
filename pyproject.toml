@@ -99,3 +99,6 @@ select = ["E", "F", "W", "I"]
 testpaths = ["test_trans.py"]
 python_files = ["test_*.py"]
 addopts = "-v"
+markers = [
+    "network: hits real services (yt-dlp, HuggingFace, Whisper); skipped unless --run-network is passed",
+]

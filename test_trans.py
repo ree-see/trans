@@ -2397,5 +2397,120 @@ class TestTranscribeGateUsesConfigToken:
         assert "Speaker diarization requires a HuggingFace token" in result.output
 
 
+class TestTranscribeNetworkSmoke:
+    """Opt-in smoke tests that hit real services.
+
+    Skipped by default. Run with: `pytest --run-network test_trans.py`.
+
+    Per-function tests bypass `app()` and mock at the yt-dlp / faster-whisper
+    seams, so a regression in Typer wiring (option resolution, exit codes,
+    argument parsing) inside the `transcribe` entry point can slip through
+    unnoticed. These two tests drive the real stack end-to-end.
+    """
+
+    # Rick Astley "Never Gonna Give You Up" — public on YouTube since 2009
+    # with native English captions, also the URL the offline `get_video_id`
+    # tests pin to. `extract_native_captions` accepts both author-uploaded
+    # and auto-generated subtitle tracks, so either source satisfies the
+    # test. If the video ever dies, swap for any other long-lived clip
+    # with native captions — assertions are lenient (exit code +
+    # native-captions branch fired + non-empty .txt).
+    _STABLE_URL = "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+
+    @staticmethod
+    def _isolate_user_state(cli_mod, monkeypatch, tmp_path):
+        """Point load_config and CacheManager at hermetic fakes so the smoke
+        tests can't read or write the user's real config / cache trees."""
+        from trans.cache import CacheManager
+        from trans.config import Config
+
+        monkeypatch.setattr(cli_mod, "load_config", lambda: Config())
+        monkeypatch.setattr(
+            cli_mod,
+            "CacheManager",
+            lambda: CacheManager(db_path=tmp_path / "c.db"),
+        )
+
+    @pytest.mark.network
+    def test_transcribe_youtube_url_native_captions(self, tmp_path, monkeypatch):
+        from typer.testing import CliRunner
+
+        from trans import cli as cli_mod
+
+        self._isolate_user_state(cli_mod, monkeypatch, tmp_path)
+        monkeypatch.chdir(tmp_path)
+        runner = CliRunner()
+        result = runner.invoke(
+            cli_mod.app,
+            ["transcribe", self._STABLE_URL, "--no-cache", "-f", "txt"],
+        )
+        # Lenient: exit 0 + a non-empty .txt somewhere under tmp_path.
+        assert result.exit_code == 0, (
+            f"transcribe failed: stdout={result.stdout!r} stderr={result.stderr!r}"
+        )
+        # Pin the *native-captions* branch — without this, a future URL swap
+        # to a no-captions clip would silently fall through to Whisper and
+        # the test would still pass, contradicting its own name.
+        assert "native captions" in result.stdout, (
+            f"native-captions branch did not fire: stdout={result.stdout!r}"
+        )
+        txts = list(tmp_path.glob("*.txt"))
+        assert txts, f"no .txt produced; cwd={list(tmp_path.iterdir())}"
+        assert txts[0].stat().st_size > 0, "txt is empty"
+
+    @pytest.mark.network
+    def test_transcribe_local_audio_file(self, tmp_path, monkeypatch):
+        """Exercise the local-file branch end-to-end: ffmpeg-generated silence
+        in, faster-whisper out. Silent audio is fine — we only assert the
+        wiring works, not that any words came out.
+        """
+        import shutil
+        import subprocess
+
+        if shutil.which("ffmpeg") is None:
+            pytest.skip("ffmpeg not installed")
+
+        from typer.testing import CliRunner
+
+        from trans import cli as cli_mod
+
+        self._isolate_user_state(cli_mod, monkeypatch, tmp_path)
+
+        wav = tmp_path / "silence.wav"
+        # 1s of mono 16kHz silence. Cheap; Whisper-tiny still loads but
+        # transcribes to empty or near-empty text.
+        subprocess.run(
+            [
+                "ffmpeg",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "anullsrc=channel_layout=mono:sample_rate=16000",
+                "-t",
+                "1",
+                str(wav),
+            ],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        assert wav.exists() and wav.stat().st_size > 0
+
+        monkeypatch.chdir(tmp_path)
+        runner = CliRunner()
+        # `--no-cache` is a no-op for local files (CacheManager is URL-only),
+        # omitted here for clarity.
+        result = runner.invoke(
+            cli_mod.app,
+            ["transcribe", str(wav), "-m", "tiny", "-f", "txt"],
+        )
+        assert result.exit_code == 0, (
+            f"transcribe failed: stdout={result.stdout!r} stderr={result.stderr!r}"
+        )
+        out = tmp_path / "silence.txt"
+        assert out.exists(), f"expected {out}, found {list(tmp_path.iterdir())}"
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

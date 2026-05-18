@@ -423,8 +423,11 @@ TikTok aggressively blocks datacenter IPs. If you see "IP address is blocked":
 # Install with dev dependencies
 pip install -e ".[dev]"
 
-# Run tests (52 tests, all offline)
+# Run tests (offline; no network)
 pytest test_trans.py
+
+# Opt-in: smoke tests against real yt-dlp + Whisper. Slow + needs network.
+pytest --run-network test_trans.py
 
 # Lint / format
 ruff check trans/
