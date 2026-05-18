@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """Unit tests for trans package."""
 
-import pytest
+import json as _json
 import sys
-import tempfile
-import os
 from pathlib import Path
+from unittest.mock import MagicMock, patch
+
+import pytest
 
 # Import functions from trans.utils
 from trans.utils import (
@@ -361,6 +362,149 @@ class TestDownloaderImpersonate:
         captured = capsys.readouterr()
         assert "boswell[tiktok]" in captured.out
         assert "backend not installed" in captured.out
+
+    def test_cookies_path_sets_cookiefile(self, tmp_path):
+        # _base_opts only stores the path string; it doesn't read the file.
+        cookies = tmp_path / "cookies.txt"
+        opts = _base_opts(
+            "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+            cookies=str(cookies),
+            quiet=True,
+        )
+        assert opts["cookiefile"] == str(cookies)
+
+    def test_no_cookies_omits_cookiefile(self):
+        opts = _base_opts(
+            "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+            cookies=None,
+            quiet=True,
+        )
+        assert "cookiefile" not in opts
+
+
+class TestExtractNativeCaptions:
+    """Cover the three output_format branches of extract_native_captions.
+
+    The function mixes a yt-dlp download call with file-shuffling logic
+    (write the .txt, rename the .vtt, or delete the source). Mock the
+    YoutubeDL context manager so the test exercises just the file logic.
+
+    Branches:
+      - txt: writes .txt + removes .en.vtt source
+      - vtt: renames .en.vtt -> .vtt, no .txt
+      - all: writes .txt AND renames .en.vtt -> .vtt
+    """
+
+    _VTT_FIXTURE = (
+        "WEBVTT\n"
+        "Kind: captions\n"
+        "Language: en\n"
+        "\n"
+        "NOTE This is a comment block\n"
+        "\n"
+        "1\n"
+        "00:00:00.000 --> 00:00:02.000\n"
+        "Hello world\n"
+        "\n"
+        "2\n"
+        "00:00:02.000 --> 00:00:04.000\n"
+        "This is a test\n"
+    )
+
+    @staticmethod
+    def _mock_ydl(output_path, fixture):
+        """Build a MagicMock that satisfies yt_dlp.YoutubeDL(opts)'s context
+        manager protocol and writes the fixture VTT to disk on .download()."""
+
+        def write_vtt(_urls):
+            Path(f"{output_path}.en.vtt").write_text(fixture)
+
+        instance = MagicMock()
+        instance.download.side_effect = write_vtt
+        mock_ctor = MagicMock()
+        mock_ctor.return_value.__enter__.return_value = instance
+        return mock_ctor
+
+    def test_txt_format_strips_vtt_to_txt_and_removes_source(self, tmp_path):
+        from trans.downloader import extract_native_captions
+
+        output_path = str(tmp_path / "video")
+        with patch(
+            "trans.downloader.yt_dlp.YoutubeDL",
+            new=self._mock_ydl(output_path, self._VTT_FIXTURE),
+        ):
+            ok = extract_native_captions(
+                "https://example.com/v", output_path, output_format="txt", quiet=True
+            )
+        assert ok is True
+        txt = Path(f"{output_path}.txt")
+        assert txt.exists()
+        body = txt.read_text()
+        # Real text survives.
+        assert "Hello world" in body
+        assert "This is a test" in body
+        # The 5 documented filter branches strip these:
+        assert "WEBVTT" not in body
+        assert "Kind:" not in body
+        assert "NOTE" not in body
+        assert "-->" not in body
+        # Pure-digit cue numbers stripped (but text containing digits is fine).
+        for line in body.splitlines():
+            assert not line.isdigit()
+        # Source has no "Language:" filter — line leaks through. Pinning the
+        # current contract; if a future change adds a Language filter, flip
+        # this to `not in body` and update the strip-filter docstring.
+        assert "Language: en" in body
+        # Source caption file removed (cleanup branch).
+        assert not Path(f"{output_path}.en.vtt").exists()
+
+    def test_vtt_format_renames_caption_no_txt(self, tmp_path):
+        from trans.downloader import extract_native_captions
+
+        output_path = str(tmp_path / "video")
+        with patch(
+            "trans.downloader.yt_dlp.YoutubeDL",
+            new=self._mock_ydl(output_path, self._VTT_FIXTURE),
+        ):
+            ok = extract_native_captions(
+                "https://example.com/v", output_path, output_format="vtt", quiet=True
+            )
+        assert ok is True
+        assert Path(f"{output_path}.vtt").exists()
+        assert not Path(f"{output_path}.en.vtt").exists()  # renamed
+        assert not Path(f"{output_path}.txt").exists()  # not written
+
+    def test_all_format_writes_txt_and_renames_vtt(self, tmp_path):
+        from trans.downloader import extract_native_captions
+
+        output_path = str(tmp_path / "video")
+        with patch(
+            "trans.downloader.yt_dlp.YoutubeDL",
+            new=self._mock_ydl(output_path, self._VTT_FIXTURE),
+        ):
+            ok = extract_native_captions(
+                "https://example.com/v", output_path, output_format="all", quiet=True
+            )
+        assert ok is True
+        assert Path(f"{output_path}.txt").exists()
+        assert Path(f"{output_path}.vtt").exists()
+        assert not Path(f"{output_path}.en.vtt").exists()  # renamed, not removed
+
+    def test_missing_caption_file_returns_false(self, tmp_path):
+        """If yt-dlp succeeds but no caption file appears (video has no subs),
+        the function returns False without raising."""
+        from trans.downloader import extract_native_captions
+
+        output_path = str(tmp_path / "video")
+        instance = MagicMock()  # download is a no-op; writes nothing
+        mock_ctor = MagicMock()
+        mock_ctor.return_value.__enter__.return_value = instance
+        with patch("trans.downloader.yt_dlp.YoutubeDL", new=mock_ctor):
+            ok = extract_native_captions(
+                "https://example.com/v", output_path, output_format="txt", quiet=True
+            )
+        assert ok is False
+        assert not Path(f"{output_path}.txt").exists()
 
 
 class TestBatchPrefetch:
@@ -926,6 +1070,353 @@ class TestCacheRoundTrip:
         text = _segments_to_clipboard_text(segs)
         # Two speaker blocks separated by a blank line, same shape as formatter txt.
         assert text == "[Speaker 1]\nhi\nhello\n\n[Speaker 2]\nworld"
+
+
+class TestWriteOutput:
+    """Direct tests for trans.formatter.write_output.
+
+    Cache round-trip tests cover this indirectly; this class pins down the
+    formatter's per-format behavior and the diarized branches so the contract
+    is testable without going through CacheManager.
+    """
+
+    @staticmethod
+    def _plain_segments():
+        return [
+            {"start": 0.0, "end": 2.5, "text": "first line"},
+            {"start": 2.5, "end": 5.0, "text": "second line"},
+        ]
+
+    @staticmethod
+    def _diarized_segments():
+        return [
+            {"start": 0.0, "end": 1.0, "text": "alpha", "speaker": "SPEAKER_00"},
+            {"start": 1.0, "end": 2.0, "text": "beta", "speaker": "SPEAKER_00"},
+            {"start": 2.0, "end": 3.0, "text": "gamma", "speaker": "SPEAKER_01"},
+            {"start": 3.0, "end": 4.0, "text": "delta", "speaker": "SPEAKER_00"},
+        ]
+
+    @pytest.mark.parametrize(
+        "fmt,ext",
+        [
+            ("txt", ".txt"),
+            ("srt", ".srt"),
+            ("vtt", ".vtt"),
+            ("json", ".json"),
+        ],
+    )
+    def test_each_format_non_diarized(self, tmp_path, fmt, ext):
+        from trans.formatter import write_output
+
+        base = str(tmp_path / "out")
+        created = write_output(self._plain_segments(), base, fmt)
+        assert len(created) == 1
+        assert created[0].suffix == ext
+        body = created[0].read_text()
+        assert "first line" in body
+        assert "second line" in body
+        if fmt == "srt":
+            assert "00:00:00,000 --> 00:00:02,500" in body  # comma decimal
+            assert body.startswith("1\n")  # 1-indexed sequence at the top
+        elif fmt == "vtt":
+            assert body.startswith("WEBVTT\n\n")
+            assert "00:00:00.000 --> 00:00:02.500" in body  # dot decimal
+        elif fmt == "json":
+            parsed = _json.loads(body)
+            assert parsed["diarization"] is False
+            assert len(parsed["segments"]) == 2
+
+    def test_format_all_writes_four_files(self, tmp_path):
+        from trans.formatter import write_output
+
+        base = str(tmp_path / "out")
+        created = write_output(self._plain_segments(), base, "all")
+        # Order isn't a documented contract; assert membership not sequence.
+        assert len(created) == 4
+        assert {p.suffix for p in created} == {".txt", ".srt", ".vtt", ".json"}
+        for p in created:
+            assert p.exists()
+            assert p.stat().st_size > 0
+
+    def test_txt_groups_same_speaker_runs(self, tmp_path):
+        """4 segments alternating A,A,B,A => 3 speaker headers, not 4."""
+        from trans.formatter import write_output
+
+        base = str(tmp_path / "out")
+        created = write_output(self._diarized_segments(), base, "txt", diarized=True)
+        body = created[0].read_text()
+        assert body.count("[Speaker 1]") == 2  # opening run + reappearance after Speaker 2
+        assert body.count("[Speaker 2]") == 1
+        # Consecutive same-speaker segments share one header.
+        assert "[Speaker 1]\nalpha\nbeta\n" in body
+
+    def test_srt_prefixes_speaker_when_diarized(self, tmp_path):
+        from trans.formatter import write_output
+
+        base = str(tmp_path / "out")
+        created = write_output(self._diarized_segments(), base, "srt", diarized=True)
+        body = created[0].read_text()
+        assert "[Speaker 1] alpha" in body
+        assert "[Speaker 1] beta" in body
+        assert "[Speaker 2] gamma" in body
+        assert "[Speaker 1] delta" in body
+        # 1-indexed sequence numbers, one per segment.
+        assert body.startswith("1\n")
+        assert "\n4\n" in body
+
+    def test_vtt_uses_voice_tag_when_diarized(self, tmp_path):
+        from trans.formatter import write_output
+
+        base = str(tmp_path / "out")
+        created = write_output(self._diarized_segments(), base, "vtt", diarized=True)
+        body = created[0].read_text()
+        assert body.startswith("WEBVTT\n\n")
+        assert "<v Speaker 1>alpha" in body
+        assert "<v Speaker 2>gamma" in body
+        # Non-diarized run shouldn't sneak the voice tag in.
+        plain = write_output(self._plain_segments(), str(tmp_path / "plain"), "vtt", diarized=False)
+        assert "<v " not in plain[0].read_text()
+
+    def test_json_includes_info_when_provided(self, tmp_path):
+        from trans.formatter import write_output
+
+        base = str(tmp_path / "out")
+        info = {"language": "en", "language_probability": 0.99, "duration": 12.3}
+        created = write_output(self._plain_segments(), base, "json", info=info)
+        parsed = _json.loads(created[0].read_text())
+        assert parsed["language"] == "en"
+        assert parsed["language_probability"] == 0.99
+        assert parsed["duration"] == 12.3
+        assert parsed["diarization"] is False
+
+        # Without info, those keys are absent.
+        plain = write_output(self._plain_segments(), str(tmp_path / "noinfo"), "json")
+        parsed_plain = _json.loads(plain[0].read_text())
+        assert "language" not in parsed_plain
+        assert "language_probability" not in parsed_plain
+        assert "duration" not in parsed_plain
+
+        # Empty info dict is falsy; source uses `if info:`, so the keys are
+        # absent same as None. Guards against a refactor to `is not None`.
+        empty = write_output(self._plain_segments(), str(tmp_path / "emptyinfo"), "json", info={})
+        parsed_empty = _json.loads(empty[0].read_text())
+        assert "language" not in parsed_empty
+        assert "language_probability" not in parsed_empty
+        assert "duration" not in parsed_empty
+
+    def test_json_speakers_list_when_diarized(self, tmp_path):
+        """Sort is on raw pyannote IDs; zero-padded form (SPEAKER_00..) means
+        alphabetical == numeric. Non-padded IDs would alphabetize wrong."""
+        from trans.formatter import write_output
+
+        base = str(tmp_path / "out")
+        created = write_output(self._diarized_segments(), base, "json", diarized=True)
+        parsed = _json.loads(created[0].read_text())
+        assert parsed["diarization"] is True
+        assert parsed["speakers"] == ["Speaker 1", "Speaker 2"]
+
+    def test_empty_segments_writes_files_without_crash(self, tmp_path):
+        from trans.formatter import write_output
+
+        base = str(tmp_path / "out")
+        created = write_output([], base, "all")
+        assert len(created) == 4
+        for p in created:
+            assert p.exists()
+        # VTT still gets its header; JSON is well-formed empty.
+        vtt = next(p for p in created if p.suffix == ".vtt")
+        assert vtt.read_text() == "WEBVTT\n\n"
+        js = next(p for p in created if p.suffix == ".json")
+        parsed = _json.loads(js.read_text())
+        assert parsed == {"diarization": False, "segments": []}
+
+
+class TestConfigPersistence:
+    """load/save round-trip and resilience to missing/malformed files."""
+
+    def test_load_missing_file_returns_defaults(self, tmp_path):
+        from trans.config import Config, load_config
+
+        cfg = load_config(path=tmp_path / "nope.toml")
+        assert cfg == Config()
+
+    def test_load_malformed_toml_returns_defaults(self, tmp_path):
+        """Silent-fallback contract: a corrupt config must not crash the CLI.
+
+        If we ever want to warn on malformed TOML, this test must change.
+        """
+        from trans.config import Config, load_config
+
+        cfg_path = tmp_path / "config.toml"
+        cfg_path.write_text("this is [garbage and not = valid toml @@@\n")
+        assert load_config(path=cfg_path) == Config()
+
+    def test_round_trip_all_fields(self, tmp_path):
+        from trans.config import (
+            CacheConfig,
+            Config,
+            DiarizationConfig,
+            load_config,
+            save_config,
+        )
+
+        cfg_path = tmp_path / "config.toml"
+        original = Config(
+            model="large",
+            format="srt",
+            language="es",
+            output_dir="/tmp/out",
+            clipboard=True,
+            quiet=True,
+            keep_audio=True,
+            cache=CacheConfig(ttl_days=7),
+            diarization=DiarizationConfig(hf_token="hf_abc123"),
+        )
+        save_config(original, path=cfg_path)
+        loaded = load_config(path=cfg_path)
+        assert loaded == original
+        # type(...) is int — not isinstance, which would silently pass for bool.
+        assert type(loaded.cache.ttl_days) is int
+
+
+class TestConfigSetValue:
+    """set_config_value typed-coercion, dotted-key routing, error handling."""
+
+    def test_unknown_key_raises_value_error(self, tmp_path):
+        from trans.config import set_config_value
+
+        with pytest.raises(ValueError, match="Unknown config key"):
+            set_config_value("bogus.key", "x", path=tmp_path / "config.toml")
+
+    @pytest.mark.parametrize(
+        "raw,expected",
+        [
+            ("true", True),
+            ("True", True),
+            ("TRUE", True),
+            ("1", True),
+            ("yes", True),
+            ("YES", True),
+            ("false", False),
+            ("0", False),
+            ("no", False),
+            ("anything", False),
+            ("", False),
+        ],
+    )
+    def test_bool_parsing_variants(self, tmp_path, raw, expected):
+        from trans.config import load_config, set_config_value
+
+        cfg_path = tmp_path / "config.toml"
+        cfg = set_config_value("clipboard", raw, path=cfg_path)
+        assert cfg.clipboard is expected
+        # Round-trip too — the TOML writer must preserve the bool, not the raw string.
+        assert load_config(path=cfg_path).clipboard is expected
+
+    def test_int_parsing_for_ttl_days(self, tmp_path):
+        """Contract guard: cache.ttl_days survives as int through set + round-trip.
+
+        save_config writes the bare int via f-string (no quotes); load_config
+        reads it back via tomllib which produces an int. Expected green on
+        first run — if this fails, the bug is in test or in save_config drift,
+        not in tomllib.
+        """
+        from trans.config import load_config, set_config_value
+
+        cfg_path = tmp_path / "config.toml"
+        cfg = set_config_value("cache.ttl_days", "30", path=cfg_path)
+        assert cfg.cache.ttl_days == 30
+        assert type(cfg.cache.ttl_days) is int
+
+        loaded = load_config(path=cfg_path)
+        assert loaded.cache.ttl_days == 30
+        assert type(loaded.cache.ttl_days) is int
+
+    def test_int_parsing_invalid_raises(self, tmp_path):
+        from trans.config import set_config_value
+
+        with pytest.raises(ValueError):
+            set_config_value("cache.ttl_days", "thirty", path=tmp_path / "config.toml")
+
+    def test_nested_key_routes_to_subsection(self, tmp_path):
+        from trans.config import Config, load_config, set_config_value
+
+        cfg_path = tmp_path / "config.toml"
+        cfg = set_config_value("cache.ttl_days", "5", path=cfg_path)
+        assert cfg.cache.ttl_days == 5
+        # Must NOT have set a flat attr on Config (which would shadow the subsection).
+        assert not hasattr(Config(), "ttl_days")
+
+        cfg = set_config_value("diarization.hf_token", "tok_xyz", path=cfg_path)
+        assert cfg.diarization.hf_token == "tok_xyz"
+        # Both subsections persist together across set_config_value calls.
+        loaded = load_config(path=cfg_path)
+        assert loaded.cache.ttl_days == 5
+        assert loaded.diarization.hf_token == "tok_xyz"
+
+
+class TestCacheManagerLifecycle:
+    """Lifecycle ops: clear, stats, put-overwrite.
+
+    Complements TestCacheRoundTrip (which covers store/retrieve). Defends the
+    lazy-init invariant — methods on a never-touched DB must not silently
+    create the file.
+    """
+
+    @staticmethod
+    def _sample_segments(text="Hello"):
+        return [{"start": 0.0, "end": 1.0, "text": text}]
+
+    def test_clear_returns_row_count(self, tmp_path):
+        from trans.cache import CacheManager
+
+        cache = CacheManager(db_path=tmp_path / "c.db")
+
+        # Never-touched DB: clear() short-circuits without creating the file.
+        # Public contract — internal flag (_schema_ensured) is incidental.
+        assert cache.clear() == 0
+        assert not (tmp_path / "c.db").exists()
+
+        cache.put("yt_a", "u1", "T1", self._sample_segments("a"))
+        cache.put("yt_b", "u2", "T2", self._sample_segments("b"))
+        assert cache.clear() == 2
+        assert cache.get("yt_a") is None
+        assert cache.get("yt_b") is None
+        # Subsequent clear on an empty table returns 0 (table exists, no rows).
+        assert cache.clear() == 0
+
+    def test_stats_shape_after_writes(self, tmp_path):
+        from trans.cache import CacheManager
+
+        cache = CacheManager(db_path=tmp_path / "c.db")
+
+        # Never-touched: zero-state without creating the file (same public
+        # contract as clear() above).
+        stats = cache.stats()
+        assert stats == {"count": 0, "size_mb": 0.0, "oldest": None, "newest": None}
+        assert not (tmp_path / "c.db").exists()
+
+        cache.put("yt_a", "u1", "T1", self._sample_segments("a"))
+        cache.put("yt_b", "u2", "T2", self._sample_segments("b"))
+        stats = cache.stats()
+        assert set(stats.keys()) == {"count", "size_mb", "oldest", "newest"}
+        assert stats["count"] == 2
+        assert stats["size_mb"] > 0
+        assert stats["oldest"] is not None and stats["newest"] is not None
+        assert stats["oldest"] <= stats["newest"]
+
+    def test_put_overwrites_existing_row(self, tmp_path):
+        from trans.cache import CacheManager
+
+        cache = CacheManager(db_path=tmp_path / "c.db")
+        cache.put("yt_x", "u1", "First", self._sample_segments("alpha"))
+        cache.put("yt_x", "u2", "Second", self._sample_segments("beta"))
+
+        hit = cache.get("yt_x")
+        assert hit is not None
+        assert hit.title == "Second"
+        assert hit.segments == [{"start": 0.0, "end": 1.0, "text": "beta"}]
+        assert cache.stats()["count"] == 1
 
 
 if __name__ == "__main__":
