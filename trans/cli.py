@@ -224,16 +224,20 @@ def _process_url(
     # via yt-dlp). Caching them would require VTT->segments parsing, which is
     # tracked as a follow-up task (task-cache-native-captions). For now,
     # native-captions runs hit the network each time (~2s warm).
-    if not force_whisper and extract_native_captions(url, out_base, fmt, quiet):
-        if not quiet:
-            typer.echo(f"\n✓ Transcription complete (native captions)")
-            _print_output_files(out_base, fmt, ["txt", "vtt"])
-        if clipboard:
-            txt_path = Path(f"{out_base}.txt")
-            if txt_path.exists():
-                _copy_to_clipboard(txt_path.read_text(encoding="utf-8"), quiet)
-        _discard_prefetched(prefetched, url, keep_audio)
-        return True
+    if not force_whisper:
+        captured = extract_native_captions(url, out_base, fmt, quiet)
+        if captured:
+            if not quiet:
+                typer.echo(f"\n✓ Transcription complete (native captions)")
+                for p in captured:
+                    if p.exists():
+                        typer.echo(f"  → {p} ({p.stat().st_size} bytes)")
+            if clipboard:
+                txt_path = Path(f"{out_base}.txt")
+                if txt_path.exists():
+                    _copy_to_clipboard(txt_path.read_text(encoding="utf-8"), quiet)
+            _discard_prefetched(prefetched, url, keep_audio)
+            return True
 
     # Download + Whisper -- reuse a prefetched audio path when present
     prefetched_path = prefetched.get(url) if prefetched else None
@@ -415,14 +419,6 @@ def _process_local(
     finally:
         if temp_audio and Path(temp_audio).exists():
             os.remove(temp_audio)
-
-
-def _print_output_files(out_base: str, fmt: str, extras: list[str]) -> None:
-    formats = [fmt] if fmt != "all" else extras
-    for ext in formats:
-        p = Path(f"{out_base}.{ext}")
-        if p.exists():
-            typer.echo(f"  → {p}")
 
 
 # ---------------------------------------------------------------------------

@@ -123,11 +123,21 @@ def extract_native_captions(
     output_path: str,
     output_format: str = "txt",
     quiet: bool = False,
-) -> bool:
+) -> list[Path]:
     """
     Attempt to extract auto-generated captions.
 
-    Returns True if a caption file was created.
+    Returns the list of caption files created on disk. An empty list signals
+    the caller should fall through to Whisper -- either because yt-dlp produced
+    no captions, or because ``output_format`` isn't one of ``txt``/``vtt``/
+    ``srt``/``all`` (today: ``json``, plus any future format added to
+    ``OUTPUT_FORMATS`` that this function doesn't explicitly handle).
+
+    Note: ``output_format == "all"`` returns ``[txt, vtt]`` -- the two formats
+    derivable from yt-dlp's auto-captions -- NOT the full four-file set that
+    ``formatter.write_output`` produces on the Whisper path. ``--format all``
+    on a native-captions hit is intentionally faster-and-narrower; pass
+    ``--force-whisper`` to route through ``write_output`` for srt/json too.
     """
     if not quiet:
         print("→ Checking for native captions...")
@@ -151,11 +161,13 @@ def extract_native_captions(
         with yt_dlp.YoutubeDL(opts) as ydl:
             ydl.download([url])
     except Exception:
-        return False
+        return []
 
     caption_file = f"{output_path}.en.{sub_format}"
     if not os.path.exists(caption_file):
-        return False
+        return []
+
+    created: list[Path] = []
 
     # Convert to plain text if requested
     if output_format in ("txt", "all"):
@@ -178,6 +190,7 @@ def extract_native_captions(
         txt_output = f"{output_path}.txt"
         with open(txt_output, "w", encoding="utf-8") as f:
             f.write("\n".join(text_lines))
+        created.append(Path(txt_output))
 
     # Clean up or rename caption file
     if output_format not in ("all", sub_format):
@@ -186,5 +199,6 @@ def extract_native_captions(
         final_name = f"{output_path}.{sub_format}"
         if caption_file != final_name:
             os.rename(caption_file, final_name)
+        created.append(Path(final_name))
 
-    return True
+    return created

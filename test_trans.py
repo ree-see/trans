@@ -412,15 +412,17 @@ class TestExtractNativeCaptions:
     )
 
     @staticmethod
-    def _mock_ydl(output_path, fixture):
+    def _mock_ydl(output_path, fixture, sub_format="vtt"):
         """Build a MagicMock that satisfies yt_dlp.YoutubeDL(opts)'s context
-        manager protocol and writes the fixture VTT to disk on .download()."""
+        manager protocol and writes the fixture to ``output_path.en.{sub_format}``
+        on .download(). The sub_format arg lets the srt branch test the real
+        rename path (yt-dlp would write .en.srt when subtitlesformat=srt)."""
 
-        def write_vtt(_urls):
-            Path(f"{output_path}.en.vtt").write_text(fixture)
+        def write_caption(_urls):
+            Path(f"{output_path}.en.{sub_format}").write_text(fixture)
 
         instance = MagicMock()
-        instance.download.side_effect = write_vtt
+        instance.download.side_effect = write_caption
         mock_ctor = MagicMock()
         mock_ctor.return_value.__enter__.return_value = instance
         return mock_ctor
@@ -431,12 +433,12 @@ class TestExtractNativeCaptions:
         output_path = str(tmp_path / "video")
         with patch(
             "trans.downloader.yt_dlp.YoutubeDL",
-            new=self._mock_ydl(output_path, self._VTT_FIXTURE),
+            new=self._mock_ydl(output_path, self._VTT_FIXTURE, "vtt"),
         ):
-            ok = extract_native_captions(
+            created = extract_native_captions(
                 "https://example.com/v", output_path, output_format="txt", quiet=True
             )
-        assert ok is True
+        assert created == [Path(f"{output_path}.txt")]
         txt = Path(f"{output_path}.txt")
         assert txt.exists()
         body = txt.read_text()
@@ -464,15 +466,32 @@ class TestExtractNativeCaptions:
         output_path = str(tmp_path / "video")
         with patch(
             "trans.downloader.yt_dlp.YoutubeDL",
-            new=self._mock_ydl(output_path, self._VTT_FIXTURE),
+            new=self._mock_ydl(output_path, self._VTT_FIXTURE, "vtt"),
         ):
-            ok = extract_native_captions(
+            created = extract_native_captions(
                 "https://example.com/v", output_path, output_format="vtt", quiet=True
             )
-        assert ok is True
-        assert Path(f"{output_path}.vtt").exists()
+        assert created == [Path(f"{output_path}.vtt")]
         assert not Path(f"{output_path}.en.vtt").exists()  # renamed
         assert not Path(f"{output_path}.txt").exists()  # not written
+
+    def test_srt_format_renames_caption_no_txt(self, tmp_path):
+        """srt path mirrors vtt: rename .en.srt -> .srt, no .txt written.
+        Regression test for the print mismatch — caller now sees the real file."""
+        from trans.downloader import extract_native_captions
+
+        output_path = str(tmp_path / "video")
+        with patch(
+            "trans.downloader.yt_dlp.YoutubeDL",
+            new=self._mock_ydl(output_path, self._VTT_FIXTURE, "srt"),
+        ):
+            created = extract_native_captions(
+                "https://example.com/v", output_path, output_format="srt", quiet=True
+            )
+        assert created == [Path(f"{output_path}.srt")]
+        assert not Path(f"{output_path}.en.srt").exists()
+        assert not Path(f"{output_path}.txt").exists()
+        assert not Path(f"{output_path}.vtt").exists()
 
     def test_all_format_writes_txt_and_renames_vtt(self, tmp_path):
         from trans.downloader import extract_native_captions
@@ -480,19 +499,36 @@ class TestExtractNativeCaptions:
         output_path = str(tmp_path / "video")
         with patch(
             "trans.downloader.yt_dlp.YoutubeDL",
-            new=self._mock_ydl(output_path, self._VTT_FIXTURE),
+            new=self._mock_ydl(output_path, self._VTT_FIXTURE, "vtt"),
         ):
-            ok = extract_native_captions(
+            created = extract_native_captions(
                 "https://example.com/v", output_path, output_format="all", quiet=True
             )
-        assert ok is True
-        assert Path(f"{output_path}.txt").exists()
-        assert Path(f"{output_path}.vtt").exists()
+        # txt is written first, then sub is renamed — pin the order.
+        assert created == [Path(f"{output_path}.txt"), Path(f"{output_path}.vtt")]
         assert not Path(f"{output_path}.en.vtt").exists()  # renamed, not removed
 
-    def test_missing_caption_file_returns_false(self, tmp_path):
+    def test_json_format_returns_empty(self, tmp_path):
+        """json isn't derivable from VTT here — caller must fall through to Whisper.
+        Today this silently returned True with zero files; new contract: empty list."""
+        from trans.downloader import extract_native_captions
+
+        output_path = str(tmp_path / "video")
+        with patch(
+            "trans.downloader.yt_dlp.YoutubeDL",
+            new=self._mock_ydl(output_path, self._VTT_FIXTURE, "vtt"),
+        ):
+            created = extract_native_captions(
+                "https://example.com/v", output_path, output_format="json", quiet=True
+            )
+        assert created == []
+        assert not Path(f"{output_path}.txt").exists()
+        assert not Path(f"{output_path}.vtt").exists()
+        assert not Path(f"{output_path}.json").exists()
+
+    def test_missing_caption_file_returns_empty(self, tmp_path):
         """If yt-dlp succeeds but no caption file appears (video has no subs),
-        the function returns False without raising."""
+        the function returns an empty list without raising — caller falls through."""
         from trans.downloader import extract_native_captions
 
         output_path = str(tmp_path / "video")
@@ -500,10 +536,10 @@ class TestExtractNativeCaptions:
         mock_ctor = MagicMock()
         mock_ctor.return_value.__enter__.return_value = instance
         with patch("trans.downloader.yt_dlp.YoutubeDL", new=mock_ctor):
-            ok = extract_native_captions(
+            created = extract_native_captions(
                 "https://example.com/v", output_path, output_format="txt", quiet=True
             )
-        assert ok is False
+        assert created == []
         assert not Path(f"{output_path}.txt").exists()
 
 
@@ -535,7 +571,7 @@ class TestBatchPrefetch:
 
         monkeypatch.setattr(cli_mod, "download_audio", fake_download)
         monkeypatch.setattr(cli_mod, "get_video_info", fake_get_video_info)
-        monkeypatch.setattr(cli_mod, "extract_native_captions", lambda *a, **kw: False)
+        monkeypatch.setattr(cli_mod, "extract_native_captions", lambda *a, **kw: [])
 
         class FakeEngine:
             def transcribe(self, audio, *, language=None, quiet=False, translate=False):
@@ -606,6 +642,43 @@ class TestBatchPrefetch:
         assert ok is True
         assert calls["download"] == 1
 
+    def test_native_captions_prints_actual_files(self, tmp_path, monkeypatch, capsys):
+        """Regression: the native-captions success branch must print the file(s) the
+        downloader actually created, not a hardcoded `['txt', 'vtt']` extras list.
+
+        Bug-as-was: `-f srt URL` on a native-captions hit printed `.srt` correctly
+        (single-format path), but `-f all URL` and `-f json URL` broke. After the
+        refactor, the cli iterates the list returned by `extract_native_captions`
+        — this test pins that contract under the `quiet=False` print loop, where
+        the bug actually lives. Single-format `srt` is the cleanest probe: any
+        leakage of hardcoded `txt`/`vtt` shows up immediately in stdout.
+        """
+        from trans import cli as cli_mod
+        from trans.cli import _process_url
+
+        calls, kwargs = self._build_fixtures(tmp_path, monkeypatch)
+        kwargs["quiet"] = False  # the bug lives in the `if not quiet:` print loop
+        kwargs["fmt"] = "srt"
+
+        def fake_native(url, out_base, fmt, quiet):
+            p = Path(f"{out_base}.srt")
+            p.write_text("1\n00:00:00,000 --> 00:00:01,000\nhi\n", encoding="utf-8")
+            return [p]
+
+        monkeypatch.setattr(cli_mod, "extract_native_captions", fake_native)
+
+        url = "https://youtube.com/watch?v=fakefakefake"
+        ok = _process_url(url, **kwargs)
+        assert ok is True
+
+        out = capsys.readouterr().out
+        # The actual file is reported.
+        assert ".srt" in out
+        # Hardcoded `["txt", "vtt"]` extras list is gone — neither extension leaks
+        # into stdout when the user requested `-f srt`.
+        assert ".txt" not in out
+        assert ".vtt" not in out
+
 
 class TestConfigBoolRoundTrip:
     """Round-trip every bool config key: write via set_config_value, reload, assert.
@@ -662,7 +735,7 @@ class TestConfigKeepAudioResolution:
             "get_video_info",
             lambda url, cookies=None, quiet=False: {"title": "stub", "duration": 1},
         )
-        monkeypatch.setattr(cli_mod, "extract_native_captions", lambda *a, **kw: False)
+        monkeypatch.setattr(cli_mod, "extract_native_captions", lambda *a, **kw: [])
 
         class StubEngine:
             def transcribe(self, audio, *, language=None, quiet=False, translate=False):
@@ -961,9 +1034,11 @@ class TestCacheRoundTrip:
         from trans.config import Config
 
         # Stub the native-captions write so it returns success without network.
+        # Return type matches the new contract: list[Path] of created files.
         def fake_native(url, out_base, fmt, quiet):
-            Path(f"{out_base}.txt").write_text("captioned content", encoding="utf-8")
-            return True
+            p = Path(f"{out_base}.txt")
+            p.write_text("captioned content", encoding="utf-8")
+            return [p]
 
         monkeypatch.setattr(cli_mod, "extract_native_captions", fake_native)
         monkeypatch.setattr(
@@ -989,7 +1064,7 @@ class TestCacheRoundTrip:
             clipboard=False,
             keep_audio=False,
             timestamp=False,
-            quiet=True,
+            quiet=False,  # exercise the iter-and-print loop so the stub's list[Path] is consumed
             cookies=None,
             no_cache=False,
             force_whisper=False,
