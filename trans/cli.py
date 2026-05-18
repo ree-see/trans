@@ -28,6 +28,7 @@ from .utils import (
 
 try:
     import pyperclip
+
     HAS_PYPERCLIP = True
 except ImportError:
     HAS_PYPERCLIP = False
@@ -63,6 +64,7 @@ def _app_callback(
 # Helpers
 # ---------------------------------------------------------------------------
 
+
 def _copy_to_clipboard(text: str, quiet: bool) -> None:
     if not HAS_PYPERCLIP:
         if not quiet:
@@ -88,7 +90,7 @@ def _output_base(
         return output
     safe = sanitize_filename(title)
     if timestamp:
-        ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         safe = f"{safe}_{ts}"
     if output_dir:
         return str(output_dir / safe)
@@ -107,6 +109,19 @@ def _resolve(cli_val, config_val, default):
 # ---------------------------------------------------------------------------
 # URL processing
 # ---------------------------------------------------------------------------
+
+
+def _discard_prefetched(prefetched: dict[str, str] | None, url: str, keep_audio: bool) -> None:
+    """Remove a prefetched audio file when a short-circuit path skips transcription."""
+    if not prefetched or keep_audio:
+        return
+    path = prefetched.get(url)
+    if path and Path(path).exists():
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
 
 def _process_url(
     url: str,
@@ -129,72 +144,96 @@ def _process_url(
     engine: TranscriptionEngine,
     cache: CacheManager,
     config: Config,
+    prefetched: dict[str, str] | None = None,
 ) -> bool:
     video_id = get_video_id(url)
     cookies_str = str(cookies) if cookies else None
 
     # Cache lookup
     if not no_cache:
-        cached = cache.get(video_id, fmt if fmt != 'all' else 'txt', config.cache.ttl_days)
+        cached = cache.get(video_id, fmt if fmt != "all" else "txt", config.cache.ttl_days)
         if cached:
             transcript, title = cached
             if not quiet:
                 typer.echo(f"\n💾 Using cached transcript for: {title}")
             out_base = _output_base(title, output, output_dir, timestamp, config)
-            out_fmt = fmt if fmt != 'all' else 'txt'
+            out_fmt = fmt if fmt != "all" else "txt"
             out_file = f"{out_base}.{out_fmt}"
-            Path(out_file).write_text(transcript, encoding='utf-8')
+            Path(out_file).write_text(transcript, encoding="utf-8")
             if not quiet:
                 typer.echo(f"✓ Transcript written to {out_file}")
             if clipboard:
                 _copy_to_clipboard(transcript, quiet)
+            _discard_prefetched(prefetched, url, keep_audio)
             return True
 
     # Fetch metadata
     info = get_video_info(url, cookies=cookies_str, quiet=quiet)
-    video_title = info.get('title', 'video')
-    duration = info.get('duration', 0)
+    video_title = info.get("title", "video")
+    duration = info.get("duration", 0)
     out_base = _output_base(video_title, output, output_dir, timestamp, config)
 
     if not quiet:
-        typer.echo(f"\n{'='*60}")
+        typer.echo(f"\n{'=' * 60}")
         typer.echo(f"📹 {video_title}")
         if duration:
             mins, secs = divmod(duration, 60)
             typer.echo(f"⏱️  Duration: {int(mins)}:{int(secs):02d}")
-        typer.echo(f"{'='*60}\n")
+        typer.echo(f"{'=' * 60}\n")
 
     # Try native captions first
     if not force_whisper and extract_native_captions(url, out_base, fmt, quiet):
         if not quiet:
             typer.echo(f"\n✓ Transcription complete (native captions)")
-            _print_output_files(out_base, fmt, ['txt', 'vtt'])
+            _print_output_files(out_base, fmt, ["txt", "vtt"])
         if not no_cache:
             txt_path = Path(f"{out_base}.txt")
             if txt_path.exists():
-                cache.put(video_id, url, video_title, txt_path.read_text(encoding='utf-8'), 'txt')
+                cache.put(video_id, url, video_title, txt_path.read_text(encoding="utf-8"), "txt")
                 if not quiet:
                     typer.echo("💾 Cached for future use")
         if clipboard:
             txt_path = Path(f"{out_base}.txt")
             if txt_path.exists():
-                _copy_to_clipboard(txt_path.read_text(encoding='utf-8'), quiet)
+                _copy_to_clipboard(txt_path.read_text(encoding="utf-8"), quiet)
+        _discard_prefetched(prefetched, url, keep_audio)
         return True
 
-    # Download + Whisper
-    audio_file = f"{out_base}.audio.mp3"
+    # Download + Whisper -- reuse a prefetched audio path when present
+    prefetched_path = prefetched.get(url) if prefetched else None
+    if (
+        prefetched_path
+        and Path(prefetched_path).exists()
+        and Path(prefetched_path).stat().st_size > 0
+    ):
+        audio_file = prefetched_path
+        prefetch_reused = True
+    else:
+        # Drop a bogus prefetch (missing or zero-byte) so it doesn't leak when
+        # we fall through to a fresh download at a different path.
+        _discard_prefetched(prefetched, url, keep_audio)
+        audio_file = f"{out_base}.audio.mp3"
+        prefetch_reused = False
     try:
-        if not quiet:
-            typer.echo("→ Downloading audio...")
-        final_audio = download_audio(url, audio_file, cookies=cookies_str, quiet=quiet)
+        if prefetch_reused:
+            if not quiet:
+                typer.echo("→ Using pre-downloaded audio")
+            final_audio = audio_file
+        else:
+            if not quiet:
+                typer.echo("→ Downloading audio...")
+            final_audio = download_audio(url, audio_file, cookies=cookies_str, quiet=quiet)
 
-        segments, info_dict = engine.transcribe(final_audio, language=language or None, quiet=quiet, translate=translate)
+        segments, info_dict = engine.transcribe(
+            final_audio, language=language or None, quiet=quiet, translate=translate
+        )
 
         if diarize:
             hf_token = get_hf_token()
             try:
                 diar_segs = run_diarization(final_audio, hf_token, num_speakers, quiet)
                 from .utils import assign_speakers_to_segments
+
                 segments = assign_speakers_to_segments(segments, diar_segs)
             except Exception as e:
                 if not quiet:
@@ -217,14 +256,16 @@ def _process_url(
         if not no_cache:
             txt_path = Path(f"{out_base}.txt")
             if txt_path.exists():
-                cache.put(video_id, url, video_title, txt_path.read_text(encoding='utf-8'), 'txt', model)
+                cache.put(
+                    video_id, url, video_title, txt_path.read_text(encoding="utf-8"), "txt", model
+                )
                 if not quiet:
                     typer.echo("💾 Cached for future use")
 
         if clipboard:
             txt_path = Path(f"{out_base}.txt")
             if txt_path.exists():
-                _copy_to_clipboard(txt_path.read_text(encoding='utf-8'), quiet)
+                _copy_to_clipboard(txt_path.read_text(encoding="utf-8"), quiet)
 
         return True
 
@@ -239,6 +280,7 @@ def _process_url(
 # ---------------------------------------------------------------------------
 # Local file processing
 # ---------------------------------------------------------------------------
+
 
 def _process_local(
     filepath: str,
@@ -267,10 +309,11 @@ def _process_local(
 
     # Get duration
     from .transcriber import get_file_duration
+
     duration = get_file_duration(str(fp))
 
     if not quiet:
-        typer.echo(f"\n{'='*60}")
+        typer.echo(f"\n{'=' * 60}")
         typer.echo(f"📁 {fp.name}")
         if duration:
             mins, secs = divmod(duration, 60)
@@ -280,7 +323,7 @@ def _process_local(
                 typer.echo(f"⏱️  Duration: {hours}:{mins:02d}:{int(secs):02d}")
             else:
                 typer.echo(f"⏱️  Duration: {int(mins)}:{int(secs):02d}")
-        typer.echo(f"{'='*60}\n")
+        typer.echo(f"{'=' * 60}\n")
 
     audio_file = str(fp)
     temp_audio = None
@@ -292,13 +335,16 @@ def _process_local(
         audio_file = temp_audio
 
     try:
-        segments, info_dict = engine.transcribe(audio_file, language=language or None, quiet=quiet, translate=translate)
+        segments, info_dict = engine.transcribe(
+            audio_file, language=language or None, quiet=quiet, translate=translate
+        )
 
         if diarize:
             hf_token = get_hf_token()
             try:
                 diar_segs = run_diarization(audio_file, hf_token, num_speakers, quiet)
                 from .utils import assign_speakers_to_segments
+
                 segments = assign_speakers_to_segments(segments, diar_segs)
             except Exception as e:
                 if not quiet:
@@ -315,7 +361,7 @@ def _process_local(
         if clipboard:
             txt_path = Path(f"{out_base}.txt")
             if txt_path.exists():
-                _copy_to_clipboard(txt_path.read_text(encoding='utf-8'), quiet)
+                _copy_to_clipboard(txt_path.read_text(encoding="utf-8"), quiet)
 
         return True
 
@@ -329,7 +375,7 @@ def _process_local(
 
 
 def _print_output_files(out_base: str, fmt: str, extras: list[str]) -> None:
-    formats = ([fmt] if fmt != 'all' else extras)
+    formats = [fmt] if fmt != "all" else extras
     for ext in formats:
         p = Path(f"{out_base}.{ext}")
         if p.exists():
@@ -340,32 +386,57 @@ def _print_output_files(out_base: str, fmt: str, extras: list[str]) -> None:
 # Main transcribe command
 # ---------------------------------------------------------------------------
 
+
 @app.command()
 def transcribe(
     inputs: list[str] = typer.Argument(..., help="Video/audio URL(s) or local file path(s)"),
-    output: str = typer.Option(None, "-o", "--output", help="Output base path (no extension). Single input only."),
+    output: str = typer.Option(
+        None, "-o", "--output", help="Output base path (no extension). Single input only."
+    ),
     output_dir: Path = typer.Option(None, "--output-dir", help="Directory for output files."),
-    model: str = typer.Option(None, "-m", "--model", help=f"Whisper model: {', '.join(WHISPER_MODELS)}"),
-    language: str = typer.Option(None, "-l", "--language", help="Language code (e.g. en, es). Auto-detect if unset."),
-    format: str = typer.Option(None, "-f", "--format", help=f"Output format: {', '.join(OUTPUT_FORMATS)}"),
+    model: str = typer.Option(
+        None, "-m", "--model", help=f"Whisper model: {', '.join(WHISPER_MODELS)}"
+    ),
+    language: str = typer.Option(
+        None, "-l", "--language", help="Language code (e.g. en, es). Auto-detect if unset."
+    ),
+    format: str = typer.Option(
+        None, "-f", "--format", help=f"Output format: {', '.join(OUTPUT_FORMATS)}"
+    ),
     clipboard: bool = typer.Option(None, "-c", "--clipboard", help="Copy transcript to clipboard."),
-    keep_audio: bool = typer.Option(False, "-k", "--keep-audio", help="Keep downloaded audio file."),
-    timestamp: bool = typer.Option(False, "-t", "--timestamp", help="Add timestamp to output filename."),
+    keep_audio: bool = typer.Option(
+        False, "-k", "--keep-audio", help="Keep downloaded audio file."
+    ),
+    timestamp: bool = typer.Option(
+        False, "-t", "--timestamp", help="Add timestamp to output filename."
+    ),
     quiet: bool = typer.Option(None, "-q", "--quiet", help="Minimal output (errors only)."),
-    cookies: Path = typer.Option(None, "--cookies", help="Path to cookies.txt for authenticated downloads."),
-    no_cache: bool = typer.Option(False, "--no-cache", help="Skip cache lookup and force fresh transcription."),
-    force_whisper: bool = typer.Option(False, "--force-whisper", help="Skip native captions, always use Whisper."),
-    diarize: bool = typer.Option(False, "-d", "--diarize", help="Enable speaker diarization (requires pyannote-audio)."),
-    num_speakers: int = typer.Option(None, "--num-speakers", help="Number of speakers (helps diarization accuracy)."),
-    translate: bool = typer.Option(False, "--translate", help="Translate non-English audio to English."),
+    cookies: Path = typer.Option(
+        None, "--cookies", help="Path to cookies.txt for authenticated downloads."
+    ),
+    no_cache: bool = typer.Option(
+        False, "--no-cache", help="Skip cache lookup and force fresh transcription."
+    ),
+    force_whisper: bool = typer.Option(
+        False, "--force-whisper", help="Skip native captions, always use Whisper."
+    ),
+    diarize: bool = typer.Option(
+        False, "-d", "--diarize", help="Enable speaker diarization (requires pyannote-audio)."
+    ),
+    num_speakers: int = typer.Option(
+        None, "--num-speakers", help="Number of speakers (helps diarization accuracy)."
+    ),
+    translate: bool = typer.Option(
+        False, "--translate", help="Translate non-English audio to English."
+    ),
 ) -> None:
     """Transcribe video/audio URLs or local files to text."""
 
     cfg = load_config()
 
     # Resolve options: CLI > config > hardcoded default
-    eff_model = _resolve(model, cfg.model, 'base')
-    eff_format = _resolve(format, cfg.format, 'txt')
+    eff_model = _resolve(model, cfg.model, "base")
+    eff_format = _resolve(format, cfg.format, "txt")
     eff_language = _resolve(language, cfg.language, None)
     eff_clipboard = clipboard if clipboard is not None else cfg.clipboard
     eff_quiet = quiet if quiet is not None else cfg.quiet
@@ -394,7 +465,9 @@ def transcribe(
         if not get_hf_token():
             typer.echo("✗ Speaker diarization requires a HuggingFace token.")
             typer.echo("  1. Create at https://huggingface.co/settings/tokens")
-            typer.echo("  2. Accept license at https://huggingface.co/pyannote/speaker-diarization-3.1")
+            typer.echo(
+                "  2. Accept license at https://huggingface.co/pyannote/speaker-diarization-3.1"
+            )
             typer.echo("  3. Set HF_TOKEN env var or run: huggingface-cli login")
             raise typer.Exit(1)
 
@@ -407,28 +480,39 @@ def transcribe(
     success_count = 0
     fail_count = 0
 
-    # Download all URLs concurrently (up to 3), then transcribe sequentially
-    downloaded: dict[str, str] = {}  # url -> audio_path
-    if urls and not any(is_local_file(u) for u in urls):
-        # Pre-download in parallel for batch URL runs
-        if len(urls) > 1:
-            def _download(url):
-                vid_id = get_video_id(url)
-                info = get_video_info(url, cookies=str(cookies) if cookies else None, quiet=eff_quiet)
-                title = info.get('title', vid_id)
-                out_b = _output_base(title, None, output_dir, timestamp, cfg)
-                audio_path = f"{out_b}.audio.mp3"
-                try:
-                    return url, download_audio(url, audio_path, cookies=str(cookies) if cookies else None, quiet=True)
-                except Exception:
-                    return url, None
+    # Pre-download URLs concurrently (up to 3) for batch runs so the
+    # sequential transcription loop can reuse the audio files. URLs whose
+    # transcripts are already cached are skipped so we don't waste bytes.
+    downloaded: dict[str, str] = {}
+    if len(urls) > 1:
+        cookies_str = str(cookies) if cookies else None
+        cache_fmt = eff_format if eff_format != "all" else "txt"
+        ttl = cfg.cache.ttl_days
 
-            with ThreadPoolExecutor(max_workers=3) as pool:
-                futures = {pool.submit(_download, u): u for u in urls}
-                for f in as_completed(futures):
-                    url, audio = f.result()
-                    if audio:
-                        downloaded[url] = audio
+        def _prefetch(url: str) -> tuple[str, str | None]:
+            if not no_cache and cache.get(get_video_id(url), cache_fmt, ttl):
+                return url, None
+            # get_video_info / download_audio raise SystemExit on hard yt-dlp
+            # errors (TikTok IP block, dead URL). Catch it here so one bad URL
+            # never kills the orchestrator before any URL gets transcribed.
+            try:
+                info = get_video_info(url, cookies=cookies_str, quiet=True)
+            except (Exception, SystemExit):
+                return url, None
+            title = info.get("title", get_video_id(url))
+            out_b = _output_base(title, None, output_dir, timestamp, cfg)
+            audio_path = f"{out_b}.audio.mp3"
+            try:
+                return url, download_audio(url, audio_path, cookies=cookies_str, quiet=True)
+            except (Exception, SystemExit):
+                return url, None
+
+        with ThreadPoolExecutor(max_workers=3) as pool:
+            futures = {pool.submit(_prefetch, u): u for u in urls}
+            for f in as_completed(futures):
+                url, audio = f.result()
+                if audio:
+                    downloaded[url] = audio
 
     for inp in inputs:
         try:
@@ -470,6 +554,7 @@ def transcribe(
                     engine=engine,
                     cache=cache,
                     config=cfg,
+                    prefetched=downloaded,
                 )
             if ok:
                 success_count += 1
@@ -484,9 +569,9 @@ def transcribe(
             fail_count += 1
 
     if len(inputs) > 1 and not eff_quiet:
-        typer.echo(f"\n{'='*60}")
+        typer.echo(f"\n{'=' * 60}")
         typer.echo(f"Summary: {success_count} succeeded, {fail_count} failed")
-        typer.echo(f"{'='*60}")
+        typer.echo(f"{'=' * 60}")
 
     if fail_count:
         raise typer.Exit(1)
@@ -495,6 +580,7 @@ def transcribe(
 # ---------------------------------------------------------------------------
 # Cache subcommands
 # ---------------------------------------------------------------------------
+
 
 @cache_app.command("clear")
 def cache_clear() -> None:
@@ -518,6 +604,7 @@ def cache_stats() -> None:
 # ---------------------------------------------------------------------------
 # Config subcommands
 # ---------------------------------------------------------------------------
+
 
 @config_app.command("show")
 def config_show() -> None:

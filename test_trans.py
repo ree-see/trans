@@ -363,6 +363,106 @@ class TestDownloaderImpersonate:
         assert "backend not installed" in captured.out
 
 
+class TestBatchPrefetch:
+    """Tests that `_process_url` honors a `prefetched` dict of pre-downloaded audio paths.
+
+    Stubs target `trans.cli.*` rather than `trans.downloader.*` because
+    `trans/cli.py` does `from .downloader import download_audio, ...`,
+    which binds the names into `trans.cli`'s namespace. Patching the
+    `trans.downloader` attribute has no effect on `_process_url`'s lookups.
+    """
+
+    @staticmethod
+    def _build_fixtures(tmp_path, monkeypatch):
+        from trans import cli as cli_mod
+        from trans.cache import CacheManager
+        from trans.config import Config
+
+        calls = {"download": 0}
+
+        def fake_download(url, output_path, cookies=None, quiet=False, **_):
+            calls["download"] += 1
+            final = output_path if str(output_path).endswith(".mp3") else f"{output_path}.mp3"
+            Path(final).write_bytes(b"\x00" * 1024)
+            return final
+
+        def fake_get_video_info(url, cookies=None, quiet=False):
+            return {"title": "fake_video", "duration": 1}
+
+        monkeypatch.setattr(cli_mod, "download_audio", fake_download)
+        monkeypatch.setattr(cli_mod, "get_video_info", fake_get_video_info)
+        monkeypatch.setattr(cli_mod, "extract_native_captions", lambda *a, **kw: False)
+
+        class FakeEngine:
+            def transcribe(self, audio, *, language=None, quiet=False, translate=False):
+                return [{"start": 0.0, "end": 1.0, "text": "hi"}], {"language": "en"}
+
+        cache = CacheManager(db_path=tmp_path / "test_cache.db")
+        cfg = Config()
+
+        common_kwargs: dict = dict(
+            output=None,
+            output_dir=tmp_path,
+            model="base",
+            language=None,
+            fmt="txt",
+            clipboard=False,
+            keep_audio=False,
+            timestamp=False,
+            quiet=True,
+            cookies=None,
+            no_cache=False,
+            force_whisper=False,
+            diarize=False,
+            num_speakers=None,
+            translate=False,
+            engine=FakeEngine(),
+            cache=cache,
+            config=cfg,
+        )
+        return calls, common_kwargs
+
+    def test_prefetched_audio_is_reused(self, tmp_path, monkeypatch):
+        """When prefetched[url] points at an existing non-empty file, skip download_audio."""
+        from trans.cli import _process_url
+
+        calls, kwargs = self._build_fixtures(tmp_path, monkeypatch)
+        prefetched_audio = tmp_path / "prefetched.audio.mp3"
+        prefetched_audio.write_bytes(b"\x00" * 2048)
+
+        url = "https://youtube.com/watch?v=fakefakefake"
+        ok = _process_url(url, prefetched={url: str(prefetched_audio)}, **kwargs)
+
+        assert ok is True
+        assert calls["download"] == 0, "download_audio must not be called when prefetch is usable"
+
+    def test_missing_prefetch_falls_back_to_download(self, tmp_path, monkeypatch):
+        """A missing prefetched path falls through to download_audio."""
+        from trans.cli import _process_url
+
+        calls, kwargs = self._build_fixtures(tmp_path, monkeypatch)
+        url = "https://youtube.com/watch?v=fakefakefake"
+        ok = _process_url(
+            url,
+            prefetched={url: str(tmp_path / "nonexistent.mp3")},
+            **kwargs,
+        )
+
+        assert ok is True
+        assert calls["download"] == 1
+
+    def test_prefetch_skipped_when_none(self, tmp_path, monkeypatch):
+        """`prefetched=None` preserves current behavior (always downloads on cache miss)."""
+        from trans.cli import _process_url
+
+        calls, kwargs = self._build_fixtures(tmp_path, monkeypatch)
+        url = "https://youtube.com/watch?v=fakefakefake"
+        ok = _process_url(url, prefetched=None, **kwargs)
+
+        assert ok is True
+        assert calls["download"] == 1
+
+
 class TestPackageImports:
     """Regression guards on the public package surface."""
 
