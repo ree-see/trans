@@ -1494,5 +1494,197 @@ class TestCacheManagerLifecycle:
         assert cache.stats()["count"] == 1
 
 
+class TestConfigFilePermissions:
+    """`save_config` must produce a 0o600 file and stay tight across overwrites.
+
+    Threat model: single-user CLI on a shared Unix host. The token in
+    `diarization.hf_token` is plaintext; the file mode is the only barrier
+    against a sibling-process-as-same-user read.
+    """
+
+    @pytest.mark.skipif(
+        sys.platform == "win32",
+        reason="POSIX permission bits are advisory on Windows",
+    )
+    def test_save_config_writes_mode_0o600(self, tmp_path):
+        import os
+        import stat
+
+        from trans.config import Config, save_config
+
+        cfg_path = tmp_path / "config.toml"
+        save_config(Config(), path=cfg_path)
+        mode = stat.S_IMODE(os.stat(cfg_path).st_mode)
+        assert mode == 0o600, f"expected 0o600, got {oct(mode)}"
+
+    @pytest.mark.skipif(
+        sys.platform == "win32",
+        reason="POSIX permission bits are advisory on Windows",
+    )
+    def test_save_config_chmod_runs_on_overwrite(self, tmp_path):
+        """Defends against the regression where the chmod only fires at create."""
+        import os
+        import stat
+
+        from trans.config import Config, save_config
+
+        cfg_path = tmp_path / "config.toml"
+        save_config(Config(), path=cfg_path)
+        os.chmod(cfg_path, 0o644)
+        save_config(Config(), path=cfg_path)
+        mode = stat.S_IMODE(os.stat(cfg_path).st_mode)
+        assert mode == 0o600, f"overwrite did not re-tighten mode (got {oct(mode)})"
+
+    def test_save_config_atomic_no_tempfile_left_behind(self, tmp_path):
+        """Atomic-write contract: parent dir must contain only the final file."""
+        from trans.config import Config, save_config
+
+        cfg_path = tmp_path / "config.toml"
+        save_config(Config(), path=cfg_path)
+        names = sorted(p.name for p in tmp_path.iterdir())
+        assert names == ["config.toml"], f"tempfile leaked into config dir: {names}"
+
+
+class TestReadHfCacheToken:
+    """Direct coverage for the cache-file source. Without these the precedence
+    tests monkeypatch the helper away — a typo in the path string would
+    silently pass CI and break only in production.
+    """
+
+    def test_returns_token_when_file_exists(self, tmp_path, monkeypatch):
+        from trans.diarizer import _read_hf_cache_token
+
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        cache_dir = tmp_path / ".cache" / "huggingface"
+        cache_dir.mkdir(parents=True)
+        (cache_dir / "token").write_text("hf_real_token\n")
+
+        assert _read_hf_cache_token() == "hf_real_token"
+
+    def test_returns_none_when_file_missing(self, tmp_path, monkeypatch):
+        from trans.diarizer import _read_hf_cache_token
+
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        assert _read_hf_cache_token() is None
+
+    def test_returns_none_on_permission_error(self, tmp_path, monkeypatch):
+        """Unreadable cache file must degrade quietly, not bubble OSError up."""
+        from trans import diarizer
+
+        def raise_perm(*_a, **_kw):
+            raise PermissionError("nope")
+
+        monkeypatch.setattr(diarizer.Path, "home", lambda: tmp_path)
+        monkeypatch.setattr(diarizer.Path, "read_text", raise_perm)
+        assert diarizer._read_hf_cache_token() is None
+
+
+class TestGetHfTokenPrecedence:
+    """`get_hf_token` source precedence: env > config > cache."""
+
+    @staticmethod
+    def _clear_envs(monkeypatch):
+        monkeypatch.delenv("HF_TOKEN", raising=False)
+        monkeypatch.delenv("HUGGING_FACE_HUB_TOKEN", raising=False)
+
+    def test_hf_token_env_wins_over_config_and_cache(self, monkeypatch):
+        from trans import diarizer
+
+        monkeypatch.setenv("HF_TOKEN", "env_tok")
+        monkeypatch.setattr(diarizer, "_read_hf_cache_token", lambda: "cache_tok")
+        assert diarizer.get_hf_token("cfg_tok") == "env_tok"
+
+    def test_hugging_face_hub_token_env_wins_over_config(self, monkeypatch):
+        from trans import diarizer
+
+        monkeypatch.delenv("HF_TOKEN", raising=False)
+        monkeypatch.setenv("HUGGING_FACE_HUB_TOKEN", "hub_tok")
+        monkeypatch.setattr(diarizer, "_read_hf_cache_token", lambda: "cache_tok")
+        assert diarizer.get_hf_token("cfg_tok") == "hub_tok"
+
+    def test_config_wins_when_no_env(self, monkeypatch):
+        from trans import diarizer
+
+        self._clear_envs(monkeypatch)
+        monkeypatch.setattr(diarizer, "_read_hf_cache_token", lambda: "cache_tok")
+        assert diarizer.get_hf_token("cfg_tok") == "cfg_tok"
+
+    def test_cache_used_when_no_env_or_config(self, monkeypatch):
+        from trans import diarizer
+
+        self._clear_envs(monkeypatch)
+        monkeypatch.setattr(diarizer, "_read_hf_cache_token", lambda: "cache_tok")
+        assert diarizer.get_hf_token("") == "cache_tok"
+
+    def test_returns_none_when_nothing_set(self, monkeypatch):
+        from trans import diarizer
+
+        self._clear_envs(monkeypatch)
+        monkeypatch.setattr(diarizer, "_read_hf_cache_token", lambda: None)
+        assert diarizer.get_hf_token("") is None
+
+
+class TestTranscribeGateUsesConfigToken:
+    """End-to-end: the diarization gate at `cli.transcribe` must honor
+    `cfg.diarization.hf_token`. Catches the regression where someone refactors
+    the gate back to a zero-arg `get_hf_token()` call.
+    """
+
+    @staticmethod
+    def _setup(tmp_path, monkeypatch, *, hf_token: str):
+        from typer.testing import CliRunner
+
+        from trans import cli as cli_mod
+        from trans import diarizer as diar_mod
+        from trans.config import Config, DiarizationConfig
+
+        monkeypatch.delenv("HF_TOKEN", raising=False)
+        monkeypatch.delenv("HUGGING_FACE_HUB_TOKEN", raising=False)
+        monkeypatch.setattr(diar_mod, "_read_hf_cache_token", lambda: None)
+
+        monkeypatch.setattr(cli_mod, "HAS_PYANNOTE", True)
+        monkeypatch.setattr(cli_mod, "HAS_FASTER_WHISPER", True)
+        monkeypatch.setattr(
+            cli_mod,
+            "load_config",
+            lambda: Config(diarization=DiarizationConfig(hf_token=hf_token)),
+        )
+        return CliRunner(), cli_mod
+
+    def test_gate_does_not_fire_when_config_token_set(self, tmp_path, monkeypatch):
+        runner, cli_mod = self._setup(tmp_path, monkeypatch, hf_token="hf_cfg")
+        result = runner.invoke(
+            cli_mod.app,
+            [
+                "transcribe",
+                "--diarize",
+                "--output-dir",
+                str(tmp_path),
+                "--quiet",
+                "https://www.youtube.com/watch?v=fakefakefake",
+            ],
+        )
+        assert "Speaker diarization requires a HuggingFace token" not in result.output, (
+            f"gate fired despite cfg.diarization.hf_token being set:\n{result.output}"
+        )
+
+    def test_gate_fires_when_no_token_anywhere(self, tmp_path, monkeypatch):
+        """Positive control: empty config + cleared envs + no cache → gate must fire."""
+        runner, cli_mod = self._setup(tmp_path, monkeypatch, hf_token="")
+        result = runner.invoke(
+            cli_mod.app,
+            [
+                "transcribe",
+                "--diarize",
+                "--output-dir",
+                str(tmp_path),
+                "--quiet",
+                "https://www.youtube.com/watch?v=fakefakefake",
+            ],
+        )
+        assert result.exit_code == 1
+        assert "Speaker diarization requires a HuggingFace token" in result.output
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

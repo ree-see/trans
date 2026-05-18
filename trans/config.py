@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import os
 import sys
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -74,7 +76,24 @@ def load_config(path: Path | None = None) -> Config:
 
 
 def save_config(config: Config, path: Path | None = None) -> None:
-    """Write config to TOML file."""
+    """Write config to TOML file atomically with owner-only (0o600) perms.
+
+    The atomic mkstemp + chmod + os.replace pattern closes two windows:
+    1. The default-umask race where a `write_text` + `chmod` sequence leaves
+       the file briefly at 0o644, exposing the HF token to sibling user
+       processes.
+    2. Symlink-following on the data write path itself (mkstemp creates a
+       fresh inode; os.replace swaps it in atomically without dereferencing
+       a symlinked destination).
+
+    Out of scope: the parent directory is not validated. If
+    `config_path.parent` is itself a symlink (or under one), `mkdir` will
+    happily traverse it. The 0o600 file mode still keeps content private to
+    the owner via the regular path; defending against a hostile-parent-dir
+    swap is left to the OS / user.
+
+    On Windows POSIX mode bits are advisory; ACLs follow the parent dir.
+    """
     config_path = path or get_config_path()
     config_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -84,9 +103,9 @@ def save_config(config: Config, path: Path | None = None) -> None:
         f'format = "{config.format}"',
         f'language = "{config.language}"',
         f'output_dir = "{config.output_dir}"',
-        f'clipboard = {str(config.clipboard).lower()}',
-        f'quiet = {str(config.quiet).lower()}',
-        f'keep_audio = {str(config.keep_audio).lower()}',
+        f"clipboard = {str(config.clipboard).lower()}",
+        f"quiet = {str(config.quiet).lower()}",
+        f"keep_audio = {str(config.keep_audio).lower()}",
         "",
         "[cache]",
         f"ttl_days = {config.cache.ttl_days}",
@@ -95,7 +114,18 @@ def save_config(config: Config, path: Path | None = None) -> None:
         f'hf_token = "{config.diarization.hf_token}"',
         "",
     ]
-    config_path.write_text("\n".join(lines))
+    body = "\n".join(lines)
+
+    fd, tmp_str = tempfile.mkstemp(prefix=".config.toml.", dir=config_path.parent)
+    tmp_path = Path(tmp_str)
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(body)
+        os.chmod(tmp_path, 0o600)
+        os.replace(tmp_path, config_path)
+    except Exception:
+        tmp_path.unlink(missing_ok=True)
+        raise
 
 
 # Valid keys for `trans config set`

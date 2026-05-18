@@ -263,6 +263,15 @@ Config is stored in the OS-appropriate location:
 - **Linux**: `~/.config/trans/config.toml`
 - **Windows**: `%APPDATA%\trans\config.toml`
 
+The `diarization.hf_token` value is stored in plaintext in the TOML file. The file is written atomically with mode `0o600` (owner-only) on Unix; on Windows POSIX mode bits are advisory and the file's ACLs follow the parent directory. The file is also subject to whatever backup or cloud-sync the OS performs (Time Machine, iCloud Drive, Dropbox), so if that's a concern, set `HF_TOKEN` in your shell instead of persisting the token to disk.
+
+HF token lookup precedence (first non-empty wins):
+
+1. `HF_TOKEN` env var
+2. `HUGGING_FACE_HUB_TOKEN` env var
+3. `diarization.hf_token` in `config.toml`
+4. `~/.cache/huggingface/token` (written by `huggingface-cli login`)
+
 ## Examples
 
 ### Quick transcription to clipboard

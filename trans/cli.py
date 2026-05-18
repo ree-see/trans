@@ -269,7 +269,7 @@ def _process_url(
         )
 
         if diarize:
-            hf_token = get_hf_token()
+            hf_token = get_hf_token(config.diarization.hf_token)
             try:
                 diar_segs = run_diarization(final_audio, hf_token, num_speakers, quiet)
                 from .utils import assign_speakers_to_segments
@@ -387,7 +387,7 @@ def _process_local(
         )
 
         if diarize:
-            hf_token = get_hf_token()
+            hf_token = get_hf_token(config.diarization.hf_token)
             try:
                 diar_segs = run_diarization(audio_file, hf_token, num_speakers, quiet)
                 from .utils import assign_speakers_to_segments
@@ -500,13 +500,16 @@ def transcribe(
             typer.echo("✗ Speaker diarization requires faster-whisper.")
             typer.echo("  Install: pip install faster-whisper")
             raise typer.Exit(1)
-        if not get_hf_token():
+        if not get_hf_token(cfg.diarization.hf_token):
             typer.echo("✗ Speaker diarization requires a HuggingFace token.")
             typer.echo("  1. Create at https://huggingface.co/settings/tokens")
             typer.echo(
                 "  2. Accept license at https://huggingface.co/pyannote/speaker-diarization-3.1"
             )
-            typer.echo("  3. Set HF_TOKEN env var or run: huggingface-cli login")
+            typer.echo("  3. Provide the token via one of:")
+            typer.echo("       trans config set diarization.hf_token hf_…")
+            typer.echo("       export HF_TOKEN=hf_…")
+            typer.echo("       huggingface-cli login")
             raise typer.Exit(1)
 
     cache = CacheManager()
