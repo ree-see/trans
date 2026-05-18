@@ -2029,6 +2029,354 @@ class TestDeviceComputeFlags:
         assert "Invalid device" in result.stdout
 
 
+# ---------------------------------------------------------------------------
+# TranscriptionEngine wrapper tests (faster-whisper mocked).
+#
+# The wrapper sits between cli/cache and the real Whisper engine. Mocking
+# `faster_whisper.WhisperModel` at the `trans.transcriber` namespace (the
+# `from faster_whisper import WhisperModel` binds the name locally inside a
+# try/except, so module-level patching is the correct seam) lets the tests
+# pin every kwarg the wrapper forwards, the segment shape it emits, and the
+# error-propagation contract without paying the model-download/load cost.
+# ---------------------------------------------------------------------------
+
+
+class _FakeSegment:
+    """Minimal stand-in for faster_whisper.transcribe.Segment."""
+
+    def __init__(self, start, end, text):
+        self.start = start
+        self.end = end
+        self.text = text
+
+
+class _FakeTranscriptionInfo:
+    """Stand-in for faster_whisper.transcribe.TranscriptionInfo.
+
+    Carries one deliberate extra attr (`transcription_options`) so the
+    info-dict whitelist test can prove the wrapper does NOT leak unknown
+    fields into the cached info — keeping `transcriber` and
+    `cache._json_safe_info` in lockstep.
+    """
+
+    def __init__(self, language="en", language_probability=0.97, duration=12.5):
+        self.language = language
+        self.language_probability = language_probability
+        self.duration = duration
+        self.transcription_options = "should-not-appear"
+
+
+class _FakeWhisperModel:
+    """Records constructor + per-call transcribe args.
+
+    Class-level `instances` is shared mutable state — the module-level
+    `fake_whisper` fixture below clears it on every test entry. Don't
+    instantiate this class outside a test that uses the fixture.
+    """
+
+    instances: list["_FakeWhisperModel"] = []
+
+    def __init__(self, model_name, device, compute_type):
+        self.init_args = {
+            "model_name": model_name,
+            "device": device,
+            "compute_type": compute_type,
+        }
+        self.transcribe_calls: list[dict] = []
+        # Set by each test before calling engine.transcribe():
+        self.segments: list[_FakeSegment] = []
+        self.info = _FakeTranscriptionInfo()
+        self.raise_on_transcribe: Exception | None = None
+        self.raise_during_iter_at: int | None = None
+        _FakeWhisperModel.instances.append(self)
+
+    def transcribe(
+        self, audio_file, *, language=None, task=None, beam_size=None, vad_filter=None, **extra
+    ):
+        # Keyword-only matches how the wrapper invokes
+        # WhisperModel.transcribe (see transcriber.py:126). The real
+        # signature is positional-or-keyword; if the wrapper ever
+        # switches to positional calls, this fake will raise TypeError
+        # — which is the failure mode we'd want.
+        self.transcribe_calls.append(
+            {
+                "audio_file": audio_file,
+                "language": language,
+                "task": task,
+                "beam_size": beam_size,
+                "vad_filter": vad_filter,
+                "extra": extra,
+            }
+        )
+        if self.raise_on_transcribe is not None:
+            raise self.raise_on_transcribe
+
+        def gen():
+            for i, seg in enumerate(self.segments):
+                if self.raise_during_iter_at == i:
+                    raise RuntimeError("decode mid-stream failed")
+                yield seg
+
+        return gen(), self.info
+
+
+@pytest.fixture
+def fake_whisper(monkeypatch):
+    """Patch `trans.transcriber.WhisperModel`, `HAS_FASTER_WHISPER`, and
+    `get_file_duration` so engine tests run offline with full control over
+    canned segments + info.
+
+    Returns the fake class itself; tests reach into
+    `_FakeWhisperModel.instances[-1]` to read back what the wrapper sent.
+    """
+    import trans.transcriber as t
+
+    _FakeWhisperModel.instances.clear()
+    monkeypatch.setattr(t, "WhisperModel", _FakeWhisperModel)
+    monkeypatch.setattr(t, "HAS_FASTER_WHISPER", True)
+    # Stub the ffprobe shellout. The value doesn't matter for most tests
+    # (only the progress-output branch reads it); a positive value keeps
+    # the progress loop alive so tests can inspect what it emits.
+    monkeypatch.setattr(t, "get_file_duration", lambda _path: 12.5)
+    return _FakeWhisperModel
+
+
+class TestTranscriberLazyModel:
+    """Lazy `WhisperModel` construction + ImportError gate."""
+
+    def test_model_property_constructs_whisper_with_init_args(self, fake_whisper):
+        from trans.transcriber import TranscriptionEngine
+
+        engine = TranscriptionEngine("medium", device="cuda", compute_type="float16")
+        assert engine._model is None  # invariant before first access
+        _ = engine.model  # trigger construction
+        assert len(fake_whisper.instances) == 1
+        assert fake_whisper.instances[0].init_args == {
+            "model_name": "medium",
+            "device": "cuda",
+            "compute_type": "float16",
+        }
+
+    def test_model_property_returns_same_instance_on_repeat_access(self, fake_whisper):
+        from trans.transcriber import TranscriptionEngine
+
+        engine = TranscriptionEngine("base")
+        first = engine.model
+        second = engine.model
+        assert first is second
+        # Construction happened exactly once — otherwise batch runs would
+        # pay the model-load cost per URL instead of once per process.
+        assert len(fake_whisper.instances) == 1
+
+    def test_model_property_raises_import_error_when_faster_whisper_missing(self, monkeypatch):
+        import trans.transcriber as t
+
+        monkeypatch.setattr(t, "HAS_FASTER_WHISPER", False)
+        monkeypatch.setattr(t, "WhisperModel", None)
+        engine = t.TranscriptionEngine("base")
+        with pytest.raises(ImportError, match="faster-whisper is not installed"):
+            _ = engine.model
+
+
+class TestTranscriberKwargs:
+    """Every kwarg the wrapper forwards to `WhisperModel.transcribe`."""
+
+    def _run(self, fake_whisper, **transcribe_kwargs):
+        from trans.transcriber import TranscriptionEngine
+
+        engine = TranscriptionEngine("base")
+        engine.transcribe("/fake/audio.mp3", quiet=True, **transcribe_kwargs)
+        return fake_whisper.instances[-1].transcribe_calls[-1]
+
+    def test_language_none_passes_none(self, fake_whisper):
+        call = self._run(fake_whisper, language=None)
+        assert call["language"] is None
+
+    def test_language_string_passes_through(self, fake_whisper):
+        call = self._run(fake_whisper, language="en")
+        assert call["language"] == "en"
+
+    def test_language_empty_string_collapses_to_none(self, fake_whisper):
+        # `language or None` shortcut — an empty config value would
+        # otherwise force Whisper to attempt detection of "".
+        call = self._run(fake_whisper, language="")
+        assert call["language"] is None
+
+    def test_translate_false_sets_task_transcribe(self, fake_whisper):
+        call = self._run(fake_whisper, translate=False)
+        assert call["task"] == "transcribe"
+
+    def test_translate_true_sets_task_translate(self, fake_whisper):
+        call = self._run(fake_whisper, translate=True)
+        assert call["task"] == "translate"
+
+    def test_constants_always_forwarded(self, fake_whisper):
+        # beam_size/vad_filter are wrapper invariants. If a refactor
+        # drops them, accuracy/latency changes silently. Pin them.
+        call = self._run(fake_whisper)
+        assert call["beam_size"] == 5
+        assert call["vad_filter"] is False
+
+
+class TestTranscriberSegmentShape:
+    """Returned segment list + info dict contract."""
+
+    def test_returns_segment_list_and_info_dict_tuple(self, fake_whisper):
+        from trans.transcriber import TranscriptionEngine
+
+        engine = TranscriptionEngine("base")
+        _ = engine.model
+        result = engine.transcribe("/fake.mp3", quiet=True)
+        assert isinstance(result, tuple) and len(result) == 2
+        segs, info = result
+        assert isinstance(segs, list)
+        assert isinstance(info, dict)
+
+    def test_segments_have_canonical_keys(self, fake_whisper):
+        from trans.transcriber import TranscriptionEngine
+
+        engine = TranscriptionEngine("base")
+        _ = engine.model  # ensure single fake instance is tracked
+        fake = fake_whisper.instances[-1]
+        fake.segments = [
+            _FakeSegment(0.0, 1.5, "hello"),
+            _FakeSegment(1.5, 3.0, "world"),
+        ]
+        segs, _ = engine.transcribe("/fake.mp3", quiet=True)
+        assert all(set(s.keys()) == {"start", "end", "text"} for s in segs)
+
+    def test_segment_text_is_stripped(self, fake_whisper):
+        from trans.transcriber import TranscriptionEngine
+
+        engine = TranscriptionEngine("base")
+        _ = engine.model
+        fake = fake_whisper.instances[-1]
+        fake.segments = [_FakeSegment(0.0, 1.0, "   padded text   ")]
+        segs, _ = engine.transcribe("/fake.mp3", quiet=True)
+        assert segs[0]["text"] == "padded text"
+
+    def test_empty_segments_generator_yields_empty_list(self, fake_whisper):
+        from trans.transcriber import TranscriptionEngine
+
+        engine = TranscriptionEngine("base")
+        _ = engine.model
+        fake_whisper.instances[-1].segments = []
+        segs, info = engine.transcribe("/fake.mp3", quiet=True)
+        assert segs == []
+        # info dict is still populated from the canned TranscriptionInfo:
+        assert info["language"] == "en"
+
+    def test_info_dict_whitelist(self, fake_whisper):
+        from trans.transcriber import TranscriptionEngine
+
+        engine = TranscriptionEngine("base")
+        _ = engine.model
+        # The canned _FakeTranscriptionInfo carries an extra attr
+        # `transcription_options`; verify it does NOT bleed through.
+        _, info = engine.transcribe("/fake.mp3", quiet=True)
+        assert set(info.keys()) == {"language", "language_probability", "duration"}
+        assert info["language"] == "en"
+        assert info["language_probability"] == 0.97
+        assert info["duration"] == 12.5
+
+
+class TestTranscriberNumpyPassthrough:
+    """Numpy floats from CTranslate2 pass through untouched.
+
+    The conversion-to-python-float boundary lives in
+    `cache._json_safe_segments`, not here. Pin the no-conversion contract
+    so a 'helpful' float(...) cast added in the transcriber wouldn't
+    silently mask a downstream cache regression.
+    """
+
+    def test_numpy_float_segment_fields_pass_through_untouched(self, fake_whisper):
+        np = pytest.importorskip("numpy")
+        from trans.transcriber import TranscriptionEngine
+
+        engine = TranscriptionEngine("base")
+        _ = engine.model
+        fake_whisper.instances[-1].segments = [
+            _FakeSegment(np.float32(0.5), np.float32(2.25), "hi"),
+        ]
+        segs, _ = engine.transcribe("/fake.mp3", quiet=True)
+        assert isinstance(segs[0]["start"], np.float32)
+        assert isinstance(segs[0]["end"], np.float32)
+
+
+class TestTranscriberErrorPropagation:
+    """The wrapper must NOT swallow or rewrap engine failures."""
+
+    def test_transcribe_failure_propagates(self, fake_whisper):
+        from trans.transcriber import TranscriptionEngine
+
+        engine = TranscriptionEngine("base")
+        _ = engine.model
+        fake_whisper.instances[-1].raise_on_transcribe = RuntimeError("decode failed")
+        with pytest.raises(RuntimeError, match="decode failed"):
+            engine.transcribe("/fake.mp3", quiet=True)
+
+    def test_segment_iteration_failure_propagates(self, fake_whisper):
+        from trans.transcriber import TranscriptionEngine
+
+        engine = TranscriptionEngine("base")
+        _ = engine.model
+        fake = fake_whisper.instances[-1]
+        fake.segments = [
+            _FakeSegment(0.0, 1.0, "a"),
+            _FakeSegment(1.0, 2.0, "b"),
+        ]
+        fake.raise_during_iter_at = 1  # raises after yielding the first segment
+        with pytest.raises(RuntimeError, match="decode mid-stream failed"):
+            engine.transcribe("/fake.mp3", quiet=True)
+
+
+class TestTranscriberQuietFlag:
+    """quiet flag suppresses prelude prints, progress writes, and the
+    no-speech warning. quiet=False emits them."""
+
+    def test_quiet_true_suppresses_all_prints(self, fake_whisper, capsys):
+        from trans.transcriber import TranscriptionEngine
+
+        engine = TranscriptionEngine("base")
+        _ = engine.model
+        fake_whisper.instances[-1].segments = [_FakeSegment(0.0, 1.0, "x")]
+        engine.transcribe("/fake.mp3", quiet=True)
+        # All four print/write sites in the wrapper are guarded by
+        # `not quiet`; stdout should be completely empty.
+        assert capsys.readouterr().out == ""
+
+    def test_quiet_false_emits_loading_and_transcribing_lines(self, fake_whisper, capsys):
+        from trans.transcriber import TranscriptionEngine
+
+        engine = TranscriptionEngine("base")
+        _ = engine.model
+        fake_whisper.instances[-1].segments = [_FakeSegment(0.0, 1.0, "x")]
+        engine.transcribe("/fake.mp3", quiet=False)
+        out = capsys.readouterr().out
+        # Substring-only: the progress writes ("\r  Progress: NN%") also
+        # appear in `out` because the fixture pins get_file_duration > 0.
+        # Substring match survives a future swap to rich/typer progress.
+        assert "Loading" in out
+        assert "Transcribing" in out
+
+    def test_quiet_false_emits_no_speech_warning_when_segments_empty(
+        self, fake_whisper, monkeypatch, capsys
+    ):
+        import trans.transcriber as t
+        from trans.transcriber import TranscriptionEngine
+
+        # Override the fixture's get_file_duration=12.5 to suppress the
+        # progress-flush line so the warning is the dominant signal in
+        # captured stdout.
+        monkeypatch.setattr(t, "get_file_duration", lambda _p: 0.0)
+        engine = TranscriptionEngine("base")
+        _ = engine.model
+        fake_whisper.instances[-1].segments = []
+        engine.transcribe("/fake.mp3", quiet=False)
+        out = capsys.readouterr().out
+        assert "No speech" in out
+
+
 class TestCacheManagerLifecycle:
     """Lifecycle ops: clear, stats, put-overwrite.
 
