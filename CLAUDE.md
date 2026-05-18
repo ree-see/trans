@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-`trans` is a single-file Python CLI tool (`trans_cli.py`) that transcribes YouTube, TikTok, Twitch videos, and local audio/video files to text. It uses `yt-dlp` for downloading, `faster-whisper` for transcription, and optionally `pyannote-audio` for speaker diarization.
+`trans` is a Python CLI tool that transcribes YouTube, TikTok, Twitch videos, and local audio/video files to text. It uses `yt-dlp` for downloading, `faster-whisper` for transcription, and optionally `pyannote-audio` for speaker diarization. Published on PyPI as `boswell`.
 
 ## Commands
 
@@ -15,40 +15,53 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 # Install for development
 uv pip install -e ".[dev]"  # includes pytest, black, ruff
 
-# Run tests
-pytest test_trans.py           # all 52 tests
+# Run tests (offline; no network)
+pytest test_trans.py           # all ~158 tests
 pytest -v test_trans.py        # verbose
 pytest -k "test_url" test_trans.py    # filter by name
 
 # Lint / format
-ruff check trans_cli.py
-black trans_cli.py
+ruff check trans/
+black trans/
 
 # Run the CLI directly
-python trans_cli.py "https://youtube.com/watch?v=..."
+python -m trans "https://youtube.com/watch?v=..."
 trans "https://youtube.com/watch?v=..."   # if installed via pip
 ```
 
 ## Architecture
 
-The entire tool lives in one file: `trans_cli.py` (~1200 lines). The flow is:
+Code lives in the `trans/` package; the historical single-file `trans_cli.py` shim was removed. `python -m trans` is the dev entrypoint via `trans/__main__.py`; the PyPI `console_scripts` entry routes `trans` straight to `trans.cli:app`.
 
-1. **`main()`** — parses args, routes each input to either `process_local_file()` or `process_url()`
-2. **URL path**: `process_url()` → checks SQLite cache → tries native captions (`extract_native_captions()`) → falls back to download + Whisper (`download_audio_with_progress()` + `transcribe_with_faster_whisper()`)
-3. **Local file path**: `process_local_file()` → extracts audio if video (`extract_audio_from_video()`) → `transcribe_local_audio()` → `transcribe_with_faster_whisper()`
-4. **Output**: `write_output()` handles txt/srt/vtt/json formats; speaker diarization merges pyannote segments with Whisper segments via `assign_speakers_to_segments()`
+Per-module map:
+
+- `trans/cli.py` — Typer CLI app, `_process_url` / `_process_local` orchestration, batch loop, prefetch worker, cache and config subcommands. Houses the `_VERBOSE` / `_TIKTOK_HELP_SHOWN` module-level toggles that the autouse test fixture resets per-test.
+- `trans/cache.py` — SQLite cache. Schema v2 stores canonical Whisper segments + info keyed by `video_id`. Rendering to txt/srt/vtt/json happens at hit time via `formatter.write_output`. Migration policy is destructive on schema mismatch (acceptable pre-1.0). `CacheManager.put` auto-prunes expired rows in the same transaction; `CacheManager.prune` and `CacheManager.stats(ttl_days=…)` expose the active/expired split.
+- `trans/config.py` — TOML-backed `Config` dataclass with `[defaults]`, `[cache]`, `[diarization]` sections. `save_config` writes atomically (mkstemp + chmod 0o600 + os.replace) to keep the HF token from leaking via umask/symlink races. `SETTABLE_KEYS` drives the `trans config set` allowlist.
+- `trans/downloader.py` — yt-dlp Python-API wrapper. `get_video_info` raises `TikTokIPBlockedError` / `DownloaderError` (no `sys.exit`) so the CLI's batch loop can continue past one bad URL. `extract_native_captions` returns a `NativeCaptureResult(files, segments)` NamedTuple; the parsed VTT segments populate the cache with `source='native'` so a subsequent run renders any format without re-fetching. `_BACKEND_HINT_SHOWN` is a one-shot toggle for the curl_cffi-missing warning.
+- `trans/transcriber.py` — `TranscriptionEngine` wraps faster-whisper's `WhisperModel`. Lazy-loaded; `device` and `compute_type` (cpu/int8 default, cuda/auto + int8_float16/float16/float32 supported) are constructor args. `extract_audio_from_video` shells out to ffmpeg for video files.
+- `trans/diarizer.py` — Optional pyannote-audio integration. Token lookup precedence: HF_TOKEN env > config > cache file.
+- `trans/formatter.py` — txt/srt/vtt/json output writer. Speaker labels rendered when segments carry a `speaker` key.
+- `trans/utils.py` — Pure functions: URL parsing (`get_video_id`), filename sanitization, VTT/SRT timestamp formatting, speaker assignment, allowlists (`WHISPER_MODELS`, `WHISPER_DEVICES`, `WHISPER_COMPUTE_TYPES`, `OUTPUT_FORMATS`).
+
+### Flow
+
+1. **URL path**: `_process_url` checks the cache, then tries `extract_native_captions` (caches the parsed segments on success), then falls through to `download_audio` + `TranscriptionEngine.transcribe`. Optional diarization merges pyannote speakers into the segment list. `write_output` renders all requested formats.
+2. **Local path**: `_process_local` extracts audio from a video via `extract_audio_from_video` if needed, then runs the same transcribe + diarize + render pipeline.
+3. **Batch**: when given multiple URLs, the CLI runs a `ThreadPoolExecutor` prefetch (up to 3 workers) so the sequential transcription loop can reuse pre-downloaded audio. Per-URL failures (including `DownloaderError`) are caught so one bad URL doesn't kill the batch; the summary line reports `N succeeded, M failed`.
 
 ### Key design decisions
 
-- **Cache**: SQLite DB at `.cache/transcripts.db`, keyed by platform-prefixed video ID (`yt_`, `tt_`, `tw_`, `twclip_`, `hash_`). Use `--no-cache` or `--clear-cache` to bypass.
-- **Whisper backend**: Uses `faster-whisper` (CTranslate2) as the primary transcription engine, not the original OpenAI Whisper CLI. Falls back to the `whisper` CLI if `faster-whisper` isn't installed.
-- **TikTok**: Uses `yt-dlp --impersonate chrome-131` for browser impersonation; IP blocks require cookies or a residential IP.
-- **YouTube**: Tries native auto-generated captions via `yt-dlp --write-auto-sub` before running Whisper.
-- **Optional deps**: `tqdm`, `rich`, `pyannote-audio`, `curl_cffi` are all guarded with `try/except ImportError` at the top of the file.
+- **Cache key**: platform-prefixed `video_id` (`yt_`, `tt_`, `tw_`, `twclip_`, `hash_`). `--no-cache` bypasses; `trans cache clear` wipes everything; `trans cache prune` removes only expired rows; `trans cache stats` reports active/expired/total counts.
+- **Whisper backend**: `faster-whisper` (CTranslate2). Defaults to cpu/int8; opt into GPU via `--device cuda --compute-type float16`. There is no longer a fallback to the original OpenAI Whisper CLI.
+- **TikTok**: `yt-dlp` with `ImpersonateTarget.from_str("chrome-131")` when `curl_cffi` is installed (the `[tiktok]` extra). Without the backend, downloads still attempt but degrade to bot-detectable. IP blocks raise `TikTokIPBlockedError`; the CLI prints the multi-line workarounds block one time per session.
+- **YouTube**: tries auto-generated captions first via `extract_native_captions`. Parsed VTT segments get cached with `source='native'`, so subsequent `trans -f json URL` runs render JSON without re-fetching.
+- **Optional deps**: `pyannote-audio` (diarization) and `curl_cffi` (TikTok impersonation) are guarded with `try/except ImportError`. `rich` is not a direct dep; it's pulled transitively by `typer`.
+- **Verbose mode**: `trans -v <subcommand>` enables tracebacks on stderr while keeping the friendly one-liner on stdout. The `-v` flag must precede the subcommand (Typer callback options don't propagate to subcommand argv).
 
 ### Tested functions (offline, no network)
 
-`get_video_id`, `sanitize_filename`, `is_tiktok_url`, `is_twitch_url`, `is_local_file`, `is_audio_file`, `format_timestamp_srt`, `format_timestamp_vtt`, `format_speaker_label`, `assign_speakers_to_segments`
+Pure utility functions in `trans.utils` are unit-tested directly. The rest of the package is covered by integration tests in `test_trans.py` that monkeypatch yt-dlp / faster-whisper / pyperclip at the seam, so the suite runs offline.
 
 ## Dependencies
 

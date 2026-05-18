@@ -42,6 +42,8 @@ class Config:
     clipboard: bool = False
     quiet: bool = False
     keep_audio: bool = False
+    device: str = "cpu"
+    compute_type: str = "int8"
     cache: CacheConfig = field(default_factory=CacheConfig)
     diarization: DiarizationConfig = field(default_factory=DiarizationConfig)
 
@@ -70,6 +72,8 @@ def load_config(path: Path | None = None) -> Config:
         clipboard=defaults.get("clipboard", False),
         quiet=defaults.get("quiet", False),
         keep_audio=defaults.get("keep_audio", False),
+        device=defaults.get("device", "cpu"),
+        compute_type=defaults.get("compute_type", "int8"),
         cache=CacheConfig(ttl_days=cache_data.get("ttl_days", 30)),
         diarization=DiarizationConfig(hf_token=diarization_data.get("hf_token", "")),
     )
@@ -106,6 +110,8 @@ def save_config(config: Config, path: Path | None = None) -> None:
         f"clipboard = {str(config.clipboard).lower()}",
         f"quiet = {str(config.quiet).lower()}",
         f"keep_audio = {str(config.keep_audio).lower()}",
+        f'device = "{config.device}"',
+        f'compute_type = "{config.compute_type}"',
         "",
         "[cache]",
         f"ttl_days = {config.cache.ttl_days}",
@@ -137,6 +143,8 @@ _CONFIG_KEYS: dict[str, str] = {
     "clipboard": "defaults.clipboard",
     "quiet": "defaults.quiet",
     "keep_audio": "defaults.keep_audio",
+    "device": "defaults.device",
+    "compute_type": "defaults.compute_type",
     "cache.ttl_days": "cache.ttl_days",
     "diarization.hf_token": "diarization.hf_token",
 }

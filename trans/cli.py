@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import sys
+import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
@@ -14,11 +15,19 @@ from . import __version__
 from .cache import CacheManager
 from .config import Config, SETTABLE_KEYS, load_config, set_config_value, get_config_path
 from .diarizer import HAS_PYANNOTE, get_hf_token, run_diarization
-from .downloader import download_audio, extract_native_captions, get_video_info
+from .downloader import (
+    DownloaderError,
+    TikTokIPBlockedError,
+    download_audio,
+    extract_native_captions,
+    get_video_info,
+)
 from .formatter import write_output
 from .transcriber import HAS_FASTER_WHISPER, TranscriptionEngine, extract_audio_from_video
 from .utils import (
     OUTPUT_FORMATS,
+    WHISPER_COMPUTE_TYPES,
+    WHISPER_DEVICES,
     WHISPER_MODELS,
     get_video_id,
     is_local_file,
@@ -32,6 +41,55 @@ try:
     HAS_PYPERCLIP = True
 except ImportError:
     HAS_PYPERCLIP = False
+
+# Module-level toggles reset by an autouse fixture in tests.
+_TIKTOK_HELP_SHOWN = False
+_VERBOSE = False
+
+
+def _maybe_print_traceback() -> None:
+    """If `-v/--verbose` was set, dump the current exception traceback to stderr.
+
+    Stderr (not stdout) so machine-parseable stdout is preserved. The
+    `_VERBOSE` global is flipped inside `_app_callback`; the autouse test
+    fixture resets it per-test.
+    """
+    if not _VERBOSE:
+        return
+    traceback.print_exc(file=sys.stderr)
+
+
+def _print_tiktok_workarounds() -> None:
+    """Render the multi-line TikTok IP-block workaround help.
+
+    Idempotent across a single batch: under ThreadPoolExecutor the help
+    block could otherwise print per-URL. The check-then-set is lock-free
+    by design — the cost of a duplicate print is cosmetic, and a lock
+    here would be overkill for warning output.
+    """
+    global _TIKTOK_HELP_SHOWN
+    if _TIKTOK_HELP_SHOWN:
+        return
+    _TIKTOK_HELP_SHOWN = True
+    typer.echo("")
+    typer.echo("Workarounds:")
+    typer.echo("  1. Use --cookies to provide cookies from a logged-in browser session")
+    typer.echo("     Export cookies with a browser extension like 'Get cookies.txt'")
+    typer.echo("")
+    typer.echo("  2. Run trans from a residential IP (not a datacenter/VPS)")
+    typer.echo("")
+    typer.echo("  3. Use a VPN or proxy with a non-datacenter IP")
+
+
+def _report_downloader_error(exc: DownloaderError, quiet: bool) -> None:
+    """Print friendly help for a downloader-layer failure (batch-safe)."""
+    if quiet:
+        return
+    typer.echo(f"✗ {exc}")
+    if isinstance(exc, TikTokIPBlockedError):
+        _print_tiktok_workarounds()
+    _maybe_print_traceback()
+
 
 app = typer.Typer(
     name="trans",
@@ -51,8 +109,16 @@ def _app_callback(
     version: bool = typer.Option(
         False, "--version", "-V", is_eager=True, help="Show version and exit."
     ),
+    verbose: bool = typer.Option(
+        False,
+        "--verbose",
+        "-v",
+        help="Show full tracebacks on error (stderr). Place BEFORE the subcommand.",
+    ),
 ) -> None:
     """trans — transcribe videos and audio files to text."""
+    global _VERBOSE
+    _VERBOSE = verbose
     if version:
         typer.echo(f"trans {__version__}")
         raise typer.Exit()
@@ -99,7 +165,10 @@ def _copy_to_clipboard(text: str, quiet: bool) -> None:
         pyperclip.copy(text)
         if not quiet:
             typer.echo("📋 Copied to clipboard")
-    except Exception as e:
+    except pyperclip.PyperclipException as e:
+        # Narrow catch: pyperclip's own failure mode (no xclip on headless
+        # Linux, etc.). Any other exception is genuinely unexpected and
+        # bubbles to the caller's handler — visible via `-v` traceback.
         if not quiet:
             typer.echo(f"⚠️  Clipboard copy failed: {e}")
 
@@ -218,24 +287,39 @@ def _process_url(
             typer.echo(f"⏱️  Duration: {int(mins)}:{int(secs):02d}")
         typer.echo(f"{'=' * 60}\n")
 
-    # Try native captions first.
-    # Note: native-captions hits are no longer cached. The cache holds canonical
-    # Whisper segments; native captions only produce a rendered .txt (or .vtt/.srt
-    # via yt-dlp). Caching them would require VTT->segments parsing, which is
-    # tracked as a follow-up task (task-cache-native-captions). For now,
-    # native-captions runs hit the network each time (~2s warm).
+    # Try native captions first. Native captions are cached as canonical
+    # segments (source='native'), so a subsequent run renders any
+    # requested format via formatter.write_output without re-fetching.
     if not force_whisper:
-        captured = extract_native_captions(url, out_base, fmt, quiet)
-        if captured:
+        result = extract_native_captions(url, out_base, fmt, quiet)
+        if result.files:
             if not quiet:
-                typer.echo(f"\n✓ Transcription complete (native captions)")
-                for p in captured:
+                typer.echo("\n✓ Transcription complete (native captions)")
+                for p in result.files:
                     if p.exists():
                         typer.echo(f"  → {p} ({p.stat().st_size} bytes)")
             if clipboard:
                 txt_path = Path(f"{out_base}.txt")
                 if txt_path.exists():
                     _copy_to_clipboard(txt_path.read_text(encoding="utf-8"), quiet)
+            # Cache the parsed segments so the next run renders any format
+            # without re-hitting yt-dlp. Skip when segments came back empty
+            # (malformed VTT) — never pollute the cache with garbage rows.
+            if not no_cache and result.segments:
+                try:
+                    cache.put(
+                        video_id,
+                        url,
+                        video_title,
+                        result.segments,
+                        info=None,
+                        model=None,
+                        source="native",
+                        ttl_days=config.cache.ttl_days,
+                    )
+                except Exception as e:
+                    if not quiet:
+                        typer.echo(f"⚠️  Cache write failed: {e} (output already on disk)")
             _discard_prefetched(prefetched, url, keep_audio)
             return True
 
@@ -304,6 +388,7 @@ def _process_url(
                     segments,
                     info=info_dict,
                     model=model,
+                    ttl_days=config.cache.ttl_days,
                 )
                 if not quiet:
                     typer.echo("💾 Cached for future use")
@@ -316,9 +401,17 @@ def _process_url(
 
         return True
 
+    except DownloaderError:
+        # Let the batch loop route this through the typed handler so the
+        # friendly TikTok workarounds block (or the one-line message) runs
+        # exactly once per session. Clean up first.
+        if Path(audio_file).exists():
+            os.remove(audio_file)
+        raise
     except Exception as e:
         if not quiet:
             typer.echo(f"✗ Error during transcription: {e}")
+        _maybe_print_traceback()
         if Path(audio_file).exists():
             os.remove(audio_file)
         return False
@@ -415,6 +508,7 @@ def _process_local(
     except Exception as e:
         if not quiet:
             typer.echo(f"✗ Error during transcription: {e}")
+        _maybe_print_traceback()
         return False
     finally:
         if temp_audio and Path(temp_audio).exists():
@@ -442,12 +536,27 @@ def transcribe(
     format: str = typer.Option(
         None, "-f", "--format", help=f"Output format: {', '.join(OUTPUT_FORMATS)}"
     ),
-    clipboard: bool = typer.Option(None, "-c", "--clipboard", help="Copy transcript to clipboard."),
-    keep_audio: bool = typer.Option(None, "-k", "--keep-audio", help="Keep downloaded audio file."),
+    clipboard: bool = typer.Option(
+        None,
+        "-c",
+        "--clipboard/--no-clipboard",
+        help="Copy transcript to clipboard. --no-clipboard overrides config clipboard=true.",
+    ),
+    keep_audio: bool = typer.Option(
+        None,
+        "-k",
+        "--keep-audio/--no-keep-audio",
+        help="Keep downloaded audio file. --no-keep-audio overrides config keep_audio=true.",
+    ),
     timestamp: bool = typer.Option(
         False, "-t", "--timestamp", help="Add timestamp to output filename."
     ),
-    quiet: bool = typer.Option(None, "-q", "--quiet", help="Minimal output (errors only)."),
+    quiet: bool = typer.Option(
+        None,
+        "-q",
+        "--quiet/--no-quiet",
+        help="Minimal output (errors only). Use --no-quiet to disable when config has quiet=true.",
+    ),
     cookies: Path = typer.Option(
         None, "--cookies", help="Path to cookies.txt for authenticated downloads."
     ),
@@ -466,6 +575,16 @@ def transcribe(
     translate: bool = typer.Option(
         False, "--translate", help="Translate non-English audio to English."
     ),
+    device: str = typer.Option(
+        None,
+        "--device",
+        help=f"Whisper device: {', '.join(WHISPER_DEVICES)}. Default: cpu.",
+    ),
+    compute_type: str = typer.Option(
+        None,
+        "--compute-type",
+        help=f"Whisper compute type: {', '.join(WHISPER_COMPUTE_TYPES)}. Default: int8.",
+    ),
 ) -> None:
     """Transcribe video/audio URLs or local files to text."""
 
@@ -478,6 +597,8 @@ def transcribe(
     eff_clipboard = _resolve_bool(clipboard, cfg.clipboard)
     eff_quiet = _resolve_bool(quiet, cfg.quiet)
     eff_keep_audio = _resolve_bool(keep_audio, cfg.keep_audio)
+    eff_device = _resolve(device, cfg.device, "cpu")
+    eff_compute_type = _resolve(compute_type, cfg.compute_type, "int8")
 
     # Validate
     if eff_model not in WHISPER_MODELS:
@@ -485,6 +606,15 @@ def transcribe(
         raise typer.Exit(1)
     if eff_format not in OUTPUT_FORMATS:
         typer.echo(f"✗ Invalid format '{eff_format}'. Choose from: {', '.join(OUTPUT_FORMATS)}")
+        raise typer.Exit(1)
+    if eff_device not in WHISPER_DEVICES:
+        typer.echo(f"✗ Invalid device '{eff_device}'. Choose from: {', '.join(WHISPER_DEVICES)}")
+        raise typer.Exit(1)
+    if eff_compute_type not in WHISPER_COMPUTE_TYPES:
+        typer.echo(
+            f"✗ Invalid compute type '{eff_compute_type}'. "
+            f"Choose from: {', '.join(WHISPER_COMPUTE_TYPES)}"
+        )
         raise typer.Exit(1)
     if output and len(inputs) > 1:
         typer.echo("✗ -o/--output can only be used with a single input")
@@ -513,7 +643,7 @@ def transcribe(
             raise typer.Exit(1)
 
     cache = CacheManager()
-    engine = TranscriptionEngine(eff_model)
+    engine = TranscriptionEngine(eff_model, device=eff_device, compute_type=eff_compute_type)
 
     urls = [i for i in inputs if not is_local_file(i)]
     files = [i for i in inputs if is_local_file(i)]
@@ -535,19 +665,21 @@ def transcribe(
             # at hit time — so prefetch can skip download regardless of -f.
             if not no_cache and cache.get(get_video_id(url), ttl):
                 return url, None
-            # get_video_info / download_audio raise SystemExit on hard yt-dlp
-            # errors (TikTok IP block, dead URL). Catch it here so one bad URL
-            # never kills the orchestrator before any URL gets transcribed.
+            # get_video_info / download_audio now raise DownloaderError for
+            # hard yt-dlp errors (TikTok IP block, dead URL). Catch it here
+            # so one bad URL never kills the orchestrator. Other unexpected
+            # exceptions are also swallowed at this layer — the main loop
+            # will retry and surface the failure with its own handler.
             try:
                 info = get_video_info(url, cookies=cookies_str, quiet=True)
-            except (Exception, SystemExit):
+            except Exception:
                 return url, None
             title = info.get("title", get_video_id(url))
             out_b = _output_base(title, None, output_dir, timestamp, cfg)
             audio_path = f"{out_b}.audio.mp3"
             try:
                 return url, download_audio(url, audio_path, cookies=cookies_str, quiet=True)
-            except (Exception, SystemExit):
+            except Exception:
                 return url, None
 
         with ThreadPoolExecutor(max_workers=3) as pool:
@@ -606,9 +738,13 @@ def transcribe(
         except KeyboardInterrupt:
             typer.echo("\n\n⚠️  Interrupted by user")
             raise typer.Exit(1)
+        except DownloaderError as e:
+            _report_downloader_error(e, eff_quiet)
+            fail_count += 1
         except Exception as e:
             if not eff_quiet:
                 typer.echo(f"✗ Unexpected error: {e}")
+            _maybe_print_traceback()
             fail_count += 1
 
     if len(inputs) > 1 and not eff_quiet:
@@ -635,13 +771,30 @@ def cache_clear() -> None:
 
 @cache_app.command("stats")
 def cache_stats() -> None:
-    """Show cache statistics."""
+    """Show cache statistics.
+
+    Counts are split into "active" (still within TTL) and "expired"
+    (would be removed by ``trans cache prune``) so users have an honest
+    signal of cache health.
+    """
+    cfg = load_config()
     cache = CacheManager()
-    s = cache.stats()
-    typer.echo(f"Entries : {s['count']}")
-    typer.echo(f"Size    : {s['size_mb']} MB")
-    typer.echo(f"Oldest  : {s['oldest'] or 'n/a'}")
-    typer.echo(f"Newest  : {s['newest'] or 'n/a'}")
+    s = cache.stats(ttl_days=cfg.cache.ttl_days)
+    typer.echo(f"Entries (total)   : {s['count']}")
+    typer.echo(f"Entries (active)  : {s['count_active']}")
+    typer.echo(f"Entries (expired) : {s['count_expired']}")
+    typer.echo(f"Size              : {s['size_mb']} MB")
+    typer.echo(f"Oldest            : {s['oldest'] or 'n/a'}")
+    typer.echo(f"Newest            : {s['newest'] or 'n/a'}")
+
+
+@cache_app.command("prune")
+def cache_prune() -> None:
+    """Delete cache entries older than TTL (defaults to ``cache.ttl_days``)."""
+    cfg = load_config()
+    cache = CacheManager()
+    count = cache.prune(cfg.cache.ttl_days)
+    typer.echo(f"✓ Pruned {count} expired entry/entries")
 
 
 # ---------------------------------------------------------------------------
@@ -656,13 +809,15 @@ def config_show() -> None:
     path = get_config_path()
     typer.echo(f"Config file: {path}")
     typer.echo("")
-    typer.echo(f"model       = {cfg.model}")
-    typer.echo(f"format      = {cfg.format}")
-    typer.echo(f"language    = {cfg.language or '(auto)'}")
-    typer.echo(f"output_dir  = {cfg.output_dir or '(cwd)'}")
-    typer.echo(f"clipboard   = {cfg.clipboard}")
-    typer.echo(f"quiet       = {cfg.quiet}")
-    typer.echo(f"keep_audio  = {cfg.keep_audio}")
+    typer.echo(f"model           = {cfg.model}")
+    typer.echo(f"format          = {cfg.format}")
+    typer.echo(f"language        = {cfg.language or '(auto)'}")
+    typer.echo(f"output_dir      = {cfg.output_dir or '(cwd)'}")
+    typer.echo(f"clipboard       = {cfg.clipboard}")
+    typer.echo(f"quiet           = {cfg.quiet}")
+    typer.echo(f"keep_audio      = {cfg.keep_audio}")
+    typer.echo(f"device          = {cfg.device}")
+    typer.echo(f"compute_type    = {cfg.compute_type}")
     typer.echo(f"cache.ttl_days          = {cfg.cache.ttl_days}")
     typer.echo(f"diarization.hf_token    = {'(set)' if cfg.diarization.hf_token else '(not set)'}")
 

@@ -4,16 +4,110 @@ from __future__ import annotations
 
 import os
 import re
-import sys
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, NamedTuple
 
 import yt_dlp
 from yt_dlp.networking.impersonate import ImpersonateTarget
 
 from .utils import is_tiktok_url
 
+
+class NativeCaptureResult(NamedTuple):
+    """Output of `extract_native_captions`.
+
+    Two channels: the files on disk (txt/vtt/srt as requested) and the
+    parsed segment list. Segments are populated when a VTT was downloaded
+    and parsed successfully; they're cached so subsequent runs can render
+    any format from canonical segments instead of re-fetching.
+
+    Truthiness rule: callers MUST check `result.files` (not `result`) to
+    decide whether the native-caption branch succeeded. The NamedTuple
+    itself is always truthy.
+    """
+
+    files: list[Path]
+    segments: list[dict[str, Any]]
+
+
+_VTT_TIMING_RE = re.compile(
+    r"^(\d{2}):(\d{2}):(\d{2})\.(\d{3})\s+-->\s+(\d{2}):(\d{2}):(\d{2})\.(\d{3})"
+)
+_VTT_INLINE_TAG_RE = re.compile(r"<[^>]+>")
+
+
+def _vtt_ts(h: str, m: str, s: str, ms: str) -> float:
+    return int(h) * 3600 + int(m) * 60 + int(s) + int(ms) / 1000.0
+
+
+def parse_vtt(vtt_text: str) -> list[dict[str, Any]]:
+    """Parse a WebVTT caption file into canonical segments.
+
+    Strips WEBVTT/Kind/Language/NOTE header lines, ignores cue identifier
+    lines, and removes inline timing tags like `<00:00:01.000>` or
+    `<c.colorE5E5E5>...</c>` from the text. Returns the same
+    `{"start", "end", "text"}` shape that `TranscriptionEngine.transcribe`
+    produces, so cache hits render through `formatter.write_output`
+    without a separate code path.
+
+    Garbage input returns `[]` rather than raising — callers gate cache
+    writes on the result being non-empty.
+    """
+    if not vtt_text or "-->" not in vtt_text:
+        return []
+    # Drop CRs so blank-line splitting is uniform.
+    blocks = vtt_text.replace("\r\n", "\n").replace("\r", "\n").split("\n\n")
+    segments: list[dict[str, Any]] = []
+    for block in blocks:
+        lines = [ln for ln in block.split("\n") if ln.strip()]
+        if not lines:
+            continue
+        # Skip the WEBVTT header / Kind / Language / NOTE blocks.
+        first = lines[0].strip()
+        if (
+            first.startswith("WEBVTT")
+            or first.startswith("Kind:")
+            or first.startswith("Language:")
+            or first.startswith("NOTE")
+        ):
+            continue
+        # Find the timing line — sometimes preceded by a cue identifier.
+        timing_idx = -1
+        for i, ln in enumerate(lines):
+            if "-->" in ln:
+                timing_idx = i
+                break
+        if timing_idx < 0:
+            continue
+        m = _VTT_TIMING_RE.match(lines[timing_idx])
+        if not m:
+            continue
+        start = _vtt_ts(m.group(1), m.group(2), m.group(3), m.group(4))
+        end = _vtt_ts(m.group(5), m.group(6), m.group(7), m.group(8))
+        text_lines = lines[timing_idx + 1 :]
+        if not text_lines:
+            continue
+        text = " ".join(_VTT_INLINE_TAG_RE.sub("", ln).strip() for ln in text_lines)
+        text = text.strip()
+        if text:
+            segments.append({"start": start, "end": end, "text": text})
+    return segments
+
+
 _BACKEND_HINT_SHOWN = False
+
+
+class DownloaderError(Exception):
+    """Base class for downloader-layer errors users care about.
+
+    Carries a one-sentence message in ``str(exc)``. The CLI layer is
+    responsible for any multi-line workaround help (so library callers
+    that aren't the CLI can format their own UX).
+    """
+
+
+class TikTokIPBlockedError(DownloaderError):
+    """TikTok refused this datacenter/VPS IP. Cookies or residential IP needed."""
 
 
 def _has_impersonate_backend() -> bool:
@@ -59,7 +153,14 @@ def _base_opts(url: str, cookies: str | None, quiet: bool) -> dict[str, Any]:
 
 
 def get_video_info(url: str, cookies: str | None = None, quiet: bool = False) -> dict[str, Any]:
-    """Fetch video metadata without downloading."""
+    """Fetch video metadata without downloading.
+
+    Raises:
+        TikTokIPBlockedError: TikTok blocked this server's IP. The CLI
+            renders the multi-line workaround block; library callers can
+            render their own UX from the exception type.
+        DownloaderError: Any other yt-dlp DownloadError.
+    """
     opts = _base_opts(url, cookies, quiet)
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
@@ -70,20 +171,8 @@ def get_video_info(url: str, cookies: str | None = None, quiet: bool = False) ->
         if is_tiktok_url(url) and (
             "IP address is blocked" in error_msg or "blocked" in error_msg.lower()
         ):
-            if not quiet:
-                print("✗ TikTok is blocking this server's IP address.")
-                print("")
-                print("Workarounds:")
-                print("  1. Use --cookies to provide cookies from a logged-in browser session")
-                print("     Export cookies with a browser extension like 'Get cookies.txt'")
-                print("")
-                print("  2. Run trans from a residential IP (not a datacenter/VPS)")
-                print("")
-                print("  3. Use a VPN or proxy with a non-datacenter IP")
-            sys.exit(1)
-        if not quiet:
-            print(f"✗ Error fetching video info: {error_msg}")
-        sys.exit(1)
+            raise TikTokIPBlockedError("TikTok is blocking this server's IP address.") from e
+        raise DownloaderError(f"Error fetching video info: {error_msg}") from e
 
 
 def download_audio(
@@ -91,7 +180,6 @@ def download_audio(
     output_path: str,
     cookies: str | None = None,
     quiet: bool = False,
-    progress_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> str:
     """Download audio from URL. Returns the final file path."""
     opts = _base_opts(url, cookies, quiet)
@@ -102,8 +190,6 @@ def download_audio(
             "outtmpl": str(output_path),
         }
     )
-    if progress_callback:
-        opts["progress_hooks"] = [progress_callback]
 
     with yt_dlp.YoutubeDL(opts) as ydl:
         ydl.download([url])
@@ -123,21 +209,35 @@ def extract_native_captions(
     output_path: str,
     output_format: str = "txt",
     quiet: bool = False,
-) -> list[Path]:
+) -> NativeCaptureResult:
     """
     Attempt to extract auto-generated captions.
 
-    Returns the list of caption files created on disk. An empty list signals
-    the caller should fall through to Whisper -- either because yt-dlp produced
-    no captions, or because ``output_format`` isn't one of ``txt``/``vtt``/
-    ``srt``/``all`` (today: ``json``, plus any future format added to
-    ``OUTPUT_FORMATS`` that this function doesn't explicitly handle).
+    Returns a `NativeCaptureResult(files, segments)`:
 
-    Note: ``output_format == "all"`` returns ``[txt, vtt]`` -- the two formats
-    derivable from yt-dlp's auto-captions -- NOT the full four-file set that
-    ``formatter.write_output`` produces on the Whisper path. ``--format all``
-    on a native-captions hit is intentionally faster-and-narrower; pass
-    ``--force-whisper`` to route through ``write_output`` for srt/json too.
+    * `files`: caption files created on disk (txt/vtt/srt as requested).
+      An empty list signals the caller should fall through to Whisper —
+      either because yt-dlp produced no captions, or because
+      ``output_format`` isn't one of ``txt``/``vtt``/``srt``/``all``
+      (today: ``json``, plus any future format added to
+      ``OUTPUT_FORMATS`` that this function doesn't explicitly handle).
+    * `segments`: parsed VTT segments in the canonical
+      ``{"start", "end", "text"}`` shape. The CLI caches these with
+      ``source="native"`` so subsequent runs can render any format
+      without re-fetching.
+
+    Truthiness rule: callers MUST check ``result.files`` (not
+    ``result``) to decide whether the branch succeeded — a NamedTuple
+    with empty fields is still truthy.
+
+    Note: ``output_format == "all"`` returns ``[txt, vtt]`` — the two
+    formats derivable from yt-dlp's auto-captions — NOT the full
+    four-file set that ``formatter.write_output`` produces on the
+    Whisper path. ``--format all`` on a native-captions hit is
+    intentionally faster-and-narrower; pass ``--force-whisper`` to
+    route through ``write_output`` for srt/json too. Cache hits on a
+    native-source row DO render via ``write_output`` and produce every
+    requested format.
     """
     if not quiet:
         print("→ Checking for native captions...")
@@ -161,21 +261,27 @@ def extract_native_captions(
         with yt_dlp.YoutubeDL(opts) as ydl:
             ydl.download([url])
     except Exception:
-        return []
+        return NativeCaptureResult([], [])
 
     caption_file = f"{output_path}.en.{sub_format}"
     if not os.path.exists(caption_file):
-        return []
+        return NativeCaptureResult([], [])
 
     created: list[Path] = []
+    segments: list[dict[str, Any]] = []
+
+    # Read the caption file once. Parse VTT into canonical segments so
+    # the CLI can cache them and render any format on a hit; SRT goes
+    # straight to disk (yt-dlp owns the format).
+    with open(caption_file, "r", encoding="utf-8") as f:
+        raw = f.read()
+    if sub_format == "vtt":
+        segments = parse_vtt(raw)
 
     # Convert to plain text if requested
     if output_format in ("txt", "all"):
-        with open(caption_file, "r", encoding="utf-8") as f:
-            lines = f.readlines()
-
         text_lines = []
-        for line in lines:
+        for line in raw.splitlines():
             line = line.strip()
             if (
                 line
@@ -201,4 +307,4 @@ def extract_native_captions(
             os.rename(caption_file, final_name)
         created.append(Path(final_name))
 
-    return created
+    return NativeCaptureResult(created, segments)

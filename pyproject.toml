@@ -82,7 +82,6 @@ packages = ["trans"]
 [tool.hatch.build.targets.sdist]
 include = [
     "trans/",
-    "trans_cli.py",
     "README.md",
     "LICENSE",
 ]

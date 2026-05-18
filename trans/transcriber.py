@@ -9,6 +9,7 @@ from typing import Any
 
 try:
     from faster_whisper import WhisperModel
+
     HAS_FASTER_WHISPER = True
 except ImportError:
     HAS_FASTER_WHISPER = False
@@ -20,9 +21,13 @@ def get_file_duration(audio_file: str) -> float:
     try:
         result = subprocess.run(
             [
-                'ffprobe', '-v', 'error',
-                '-show_entries', 'format=duration',
-                '-of', 'default=noprint_wrappers=1:nokey=1',
+                "ffprobe",
+                "-v",
+                "error",
+                "-show_entries",
+                "format=duration",
+                "-of",
+                "default=noprint_wrappers=1:nokey=1",
                 str(audio_file),
             ],
             capture_output=True,
@@ -41,11 +46,15 @@ def extract_audio_from_video(video_path: str, output_audio: str, quiet: bool = F
         print("→ Extracting audio from video...")
 
     cmd = [
-        'ffmpeg', '-y',
-        '-i', str(video_path),
-        '-vn',
-        '-acodec', 'libmp3lame',
-        '-q:a', '2',
+        "ffmpeg",
+        "-y",
+        "-i",
+        str(video_path),
+        "-vn",
+        "-acodec",
+        "libmp3lame",
+        "-q:a",
+        "2",
         str(output_audio),
     ]
 
@@ -60,10 +69,24 @@ def extract_audio_from_video(video_path: str, output_audio: str, quiet: bool = F
 
 
 class TranscriptionEngine:
-    """Lazy-loading Whisper model, reused across multiple transcriptions."""
+    """Lazy-loading Whisper model, reused across multiple transcriptions.
 
-    def __init__(self, model_name: str = 'base') -> None:
+    ``device`` and ``compute_type`` map straight to ``faster_whisper``'s
+    `WhisperModel` constructor. Defaults preserve the historical
+    cpu/int8 behavior; the CLI ``--device`` / ``--compute-type`` flags
+    (and matching config keys) opt into GPU acceleration when the
+    appropriate wheel is installed.
+    """
+
+    def __init__(
+        self,
+        model_name: str = "base",
+        device: str = "cpu",
+        compute_type: str = "int8",
+    ) -> None:
         self.model_name = model_name
+        self.device = device
+        self.compute_type = compute_type
         self._model: WhisperModel | None = None
 
     @property
@@ -73,7 +96,9 @@ class TranscriptionEngine:
                 raise ImportError(
                     "faster-whisper is not installed. Run: pip install faster-whisper"
                 )
-            self._model = WhisperModel(self.model_name, device="cpu", compute_type="int8")
+            self._model = WhisperModel(
+                self.model_name, device=self.device, compute_type=self.compute_type
+            )
         return self._model
 
     def transcribe(
@@ -111,9 +136,9 @@ class TranscriptionEngine:
 
         for segment in segments_gen:
             seg_data = {
-                'start': segment.start,
-                'end': segment.end,
-                'text': segment.text.strip(),
+                "start": segment.start,
+                "end": segment.end,
+                "text": segment.text.strip(),
             }
             segments_list.append(seg_data)
 
@@ -125,15 +150,15 @@ class TranscriptionEngine:
                     last_percent = percent
 
         if not quiet and total_duration > 0:
-            sys.stdout.write('\r  Progress: 100%\n')
+            sys.stdout.write("\r  Progress: 100%\n")
             sys.stdout.flush()
 
         if not quiet and not segments_list:
             print("  Warning: No speech detected in audio")
 
         info_dict = {
-            'language': info.language,
-            'language_probability': info.language_probability,
-            'duration': info.duration,
+            "language": info.language,
+            "language_probability": info.language_probability,
+            "duration": info.duration,
         }
         return segments_list, info_dict

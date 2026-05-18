@@ -28,6 +28,27 @@ from trans.downloader import _base_opts
 from yt_dlp.networking.impersonate import ImpersonateTarget
 
 
+@pytest.fixture(autouse=True)
+def _reset_module_toggles():
+    """Reset per-session warning/verbose flags so test order is irrelevant.
+
+    Three module-level flags accumulate state across a process:
+    `trans.downloader._BACKEND_HINT_SHOWN`, `trans.cli._TIKTOK_HELP_SHOWN`,
+    and `trans.cli._VERBOSE`. Without this fixture the second TikTok-batch
+    test in a run would silently skip the help block, and a verbose test
+    that fails to clean up would leak verbose mode into unrelated tests.
+    """
+    import trans.cli as _cli
+    import trans.downloader as _dl
+
+    _dl._BACKEND_HINT_SHOWN = False
+    if hasattr(_cli, "_TIKTOK_HELP_SHOWN"):
+        _cli._TIKTOK_HELP_SHOWN = False
+    if hasattr(_cli, "_VERBOSE"):
+        _cli._VERBOSE = False
+    yield
+
+
 class TestGetVideoId:
     """Tests for get_video_id() URL parsing."""
 
@@ -438,7 +459,11 @@ class TestExtractNativeCaptions:
             created = extract_native_captions(
                 "https://example.com/v", output_path, output_format="txt", quiet=True
             )
-        assert created == [Path(f"{output_path}.txt")]
+        assert created.files == [Path(f"{output_path}.txt")]
+        # Segments come from parsing the source VTT — non-empty since the
+        # fixture has two cues.
+        assert len(created.segments) == 2
+        assert created.segments[0]["text"] == "Hello world"
         txt = Path(f"{output_path}.txt")
         assert txt.exists()
         body = txt.read_text()
@@ -471,7 +496,8 @@ class TestExtractNativeCaptions:
             created = extract_native_captions(
                 "https://example.com/v", output_path, output_format="vtt", quiet=True
             )
-        assert created == [Path(f"{output_path}.vtt")]
+        assert created.files == [Path(f"{output_path}.vtt")]
+        assert len(created.segments) == 2  # VTT was parsed pre-rename.
         assert not Path(f"{output_path}.en.vtt").exists()  # renamed
         assert not Path(f"{output_path}.txt").exists()  # not written
 
@@ -488,7 +514,9 @@ class TestExtractNativeCaptions:
             created = extract_native_captions(
                 "https://example.com/v", output_path, output_format="srt", quiet=True
             )
-        assert created == [Path(f"{output_path}.srt")]
+        assert created.files == [Path(f"{output_path}.srt")]
+        # SRT branch doesn't parse — yt-dlp owns that format. Segments stay empty.
+        assert created.segments == []
         assert not Path(f"{output_path}.en.srt").exists()
         assert not Path(f"{output_path}.txt").exists()
         assert not Path(f"{output_path}.vtt").exists()
@@ -505,7 +533,8 @@ class TestExtractNativeCaptions:
                 "https://example.com/v", output_path, output_format="all", quiet=True
             )
         # txt is written first, then sub is renamed — pin the order.
-        assert created == [Path(f"{output_path}.txt"), Path(f"{output_path}.vtt")]
+        assert created.files == [Path(f"{output_path}.txt"), Path(f"{output_path}.vtt")]
+        assert len(created.segments) == 2
         assert not Path(f"{output_path}.en.vtt").exists()  # renamed, not removed
 
     def test_json_format_returns_empty(self, tmp_path):
@@ -521,7 +550,10 @@ class TestExtractNativeCaptions:
             created = extract_native_captions(
                 "https://example.com/v", output_path, output_format="json", quiet=True
             )
-        assert created == []
+        assert created.files == []
+        # json branch still parses the VTT before deciding it has nothing to
+        # write — segments are present but discarded by the empty-files check.
+        assert len(created.segments) == 2
         assert not Path(f"{output_path}.txt").exists()
         assert not Path(f"{output_path}.vtt").exists()
         assert not Path(f"{output_path}.json").exists()
@@ -539,8 +571,232 @@ class TestExtractNativeCaptions:
             created = extract_native_captions(
                 "https://example.com/v", output_path, output_format="txt", quiet=True
             )
-        assert created == []
+        assert created.files == []
+        assert created.segments == []
         assert not Path(f"{output_path}.txt").exists()
+
+
+class TestParseVtt:
+    """`parse_vtt` is the new VTT->segments parser used by cache writes."""
+
+    def test_basic_two_cues(self):
+        from trans.downloader import parse_vtt
+
+        vtt = (
+            "WEBVTT\n"
+            "Kind: captions\n"
+            "Language: en\n"
+            "\n"
+            "00:00:00.000 --> 00:00:02.000\n"
+            "Hello world\n"
+            "\n"
+            "00:00:02.000 --> 00:00:04.500\n"
+            "Second cue\n"
+        )
+        segs = parse_vtt(vtt)
+        assert len(segs) == 2
+        assert segs[0] == {"start": 0.0, "end": 2.0, "text": "Hello world"}
+        assert segs[1] == {"start": 2.0, "end": 4.5, "text": "Second cue"}
+
+    def test_strips_inline_timing_tags(self):
+        """yt-dlp auto-captions sometimes embed `<00:00:01.000>` and `<c>` tags."""
+        from trans.downloader import parse_vtt
+
+        vtt = (
+            "WEBVTT\n"
+            "\n"
+            "00:00:01.000 --> 00:00:03.000\n"
+            "<00:00:01.000><c.colorE5E5E5>Hello</c> <00:00:02.000><c>world</c>\n"
+        )
+        segs = parse_vtt(vtt)
+        assert len(segs) == 1
+        assert "<" not in segs[0]["text"]
+        assert "Hello" in segs[0]["text"]
+        assert "world" in segs[0]["text"]
+
+    def test_empty_input_returns_empty_list(self):
+        from trans.downloader import parse_vtt
+
+        assert parse_vtt("") == []
+        assert parse_vtt("not a vtt file at all") == []
+
+    def test_garbage_blocks_skipped_silently(self):
+        """A malformed cue block doesn't crash the parser; surrounding ones survive."""
+        from trans.downloader import parse_vtt
+
+        vtt = (
+            "WEBVTT\n"
+            "\n"
+            "00:00:00.000 --> 00:00:01.000\n"
+            "ok\n"
+            "\n"
+            "this block has no timing line\n"
+            "\n"
+            "00:00:02.000 --> 00:00:03.000\n"
+            "also ok\n"
+        )
+        segs = parse_vtt(vtt)
+        assert [s["text"] for s in segs] == ["ok", "also ok"]
+
+
+class TestDownloaderErrors:
+    """Typed exceptions in trans.downloader replace the old sys.exit(1) paths.
+
+    Library callers (and the CLI's batch handler) can now distinguish
+    TikTok IP blocks from generic download failures without parsing strings
+    or catching SystemExit.
+    """
+
+    def test_get_video_info_raises_tiktok_blocked_on_ip_block(self, monkeypatch):
+        from trans import downloader as dl_mod
+
+        class FakeYDL:
+            def __init__(self, *_a, **_kw):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_a):
+                return False
+
+            def extract_info(self, *_a, **_kw):
+                raise dl_mod.yt_dlp.utils.DownloadError(
+                    "ERROR: [TikTok] 123: Your IP address is blocked from accessing this post"
+                )
+
+        monkeypatch.setattr(dl_mod.yt_dlp, "YoutubeDL", FakeYDL)
+
+        with pytest.raises(dl_mod.TikTokIPBlockedError):
+            dl_mod.get_video_info("https://www.tiktok.com/@u/video/123", quiet=True)
+
+    def test_get_video_info_raises_downloader_error_on_generic_failure(self, monkeypatch):
+        from trans import downloader as dl_mod
+
+        class FakeYDL:
+            def __init__(self, *_a, **_kw):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_a):
+                return False
+
+            def extract_info(self, *_a, **_kw):
+                raise dl_mod.yt_dlp.utils.DownloadError("ERROR: video unavailable")
+
+        monkeypatch.setattr(dl_mod.yt_dlp, "YoutubeDL", FakeYDL)
+
+        # Plain DownloaderError, not TikTokIPBlockedError, on a non-TikTok URL.
+        with pytest.raises(dl_mod.DownloaderError) as exc_info:
+            dl_mod.get_video_info("https://www.youtube.com/watch?v=abc12345678", quiet=True)
+        assert not isinstance(exc_info.value, dl_mod.TikTokIPBlockedError)
+
+    def test_batch_continues_after_one_url_raises_downloader_error(self, monkeypatch, tmp_path):
+        """Per the task spec: a DownloaderError on URL 1 must NOT kill URLs 2+.
+
+        Pre-fix, downloader.py called sys.exit(1) which raised SystemExit
+        and bypassed the batch loop's `except Exception` clause, aborting
+        the whole batch. The typed exception now flows through the
+        DownloaderError handler.
+        """
+        from typer.testing import CliRunner
+
+        from trans import cli as cli_mod
+        from trans.downloader import DownloaderError
+
+        calls = {"url1": 0, "url2": 0}
+
+        def fake_get_video_info(url, **_kw):
+            if "111" in url:
+                calls["url1"] += 1
+                raise DownloaderError("Error fetching video info: simulated")
+            calls["url2"] += 1
+            return {"title": "ok", "duration": 1.0}
+
+        def fake_extract_native_captions(url, out, fmt, quiet=True):
+            # Pretend URL 2 has perfectly serviceable native captions.
+            from trans.downloader import NativeCaptureResult
+
+            txt = Path(f"{out}.txt")
+            txt.write_text("hello", encoding="utf-8")
+            return NativeCaptureResult([txt], [])
+
+        monkeypatch.setattr(cli_mod, "get_video_info", fake_get_video_info)
+        monkeypatch.setattr(cli_mod, "extract_native_captions", fake_extract_native_captions)
+        monkeypatch.chdir(tmp_path)
+
+        runner = CliRunner()
+        url1 = "https://example.com/111"
+        url2 = "https://example.com/222"
+        result = runner.invoke(cli_mod.app, ["transcribe", url1, url2, "--no-cache"])
+
+        # One URL failed (exit 1) but the second still ran. The prefetch
+        # loop calls get_video_info once per URL silently; the main loop
+        # then re-runs each URL — so the failing URL gets hit twice, the
+        # succeeding one twice too. The contract under test is "URL 2 was
+        # processed", not the exact call count.
+        assert result.exit_code == 1
+        assert calls["url1"] >= 1
+        assert calls["url2"] >= 1
+        assert "Summary: 1 succeeded, 1 failed" in result.stdout
+
+
+class TestVerboseFlag:
+    """`-v/--verbose` prints tracebacks to stderr; stdout stays clean."""
+
+    @staticmethod
+    def _run(monkeypatch, tmp_path, args, raise_in_native_captions=True):
+        from typer.testing import CliRunner
+
+        from trans import cli as cli_mod
+
+        def fake_get_video_info(url, **_kw):
+            return {"title": "ok", "duration": 1.0}
+
+        def fake_extract_native_captions(url, out, fmt, quiet=True):
+            from trans.downloader import NativeCaptureResult
+
+            if raise_in_native_captions:
+                raise RuntimeError("boom-from-extract")
+            txt = Path(f"{out}.txt")
+            txt.write_text("hi", encoding="utf-8")
+            return NativeCaptureResult([txt], [])
+
+        monkeypatch.setattr(cli_mod, "get_video_info", fake_get_video_info)
+        monkeypatch.setattr(cli_mod, "extract_native_captions", fake_extract_native_captions)
+        monkeypatch.chdir(tmp_path)
+        runner = CliRunner()
+        return runner.invoke(cli_mod.app, args)
+
+    def test_verbose_prints_traceback_to_stderr(self, monkeypatch, tmp_path):
+        # CliRunner separates stdout and stderr on result.stdout / result.stderr
+        # so we can assert the stream-separation contract directly.
+        result = self._run(
+            monkeypatch,
+            tmp_path,
+            ["-v", "transcribe", "https://example.com/v", "--no-cache"],
+        )
+        # Friendly one-liner on stdout via typer.echo.
+        assert "boom-from-extract" in result.stdout
+        # Traceback on stderr — and NOT on stdout (preserves machine-parseable stdout).
+        assert "Traceback" in result.stderr
+        assert "boom-from-extract" in result.stderr
+        assert "Traceback" not in result.stdout
+        assert result.exit_code == 1
+
+    def test_no_verbose_omits_traceback(self, monkeypatch, tmp_path):
+        result = self._run(
+            monkeypatch,
+            tmp_path,
+            ["transcribe", "https://example.com/v", "--no-cache"],
+        )
+        # Friendly one-liner present; traceback absent from both streams.
+        assert "boom-from-extract" in result.stdout
+        assert "Traceback" not in result.stderr
+        assert "Traceback" not in result.stdout
+        assert result.exit_code == 1
 
 
 class TestBatchPrefetch:
@@ -571,7 +827,9 @@ class TestBatchPrefetch:
 
         monkeypatch.setattr(cli_mod, "download_audio", fake_download)
         monkeypatch.setattr(cli_mod, "get_video_info", fake_get_video_info)
-        monkeypatch.setattr(cli_mod, "extract_native_captions", lambda *a, **kw: [])
+        from trans.downloader import NativeCaptureResult as _NCR
+
+        monkeypatch.setattr(cli_mod, "extract_native_captions", lambda *a, **kw: _NCR([], []))
 
         class FakeEngine:
             def transcribe(self, audio, *, language=None, quiet=False, translate=False):
@@ -661,9 +919,11 @@ class TestBatchPrefetch:
         kwargs["fmt"] = "srt"
 
         def fake_native(url, out_base, fmt, quiet):
+            from trans.downloader import NativeCaptureResult
+
             p = Path(f"{out_base}.srt")
             p.write_text("1\n00:00:00,000 --> 00:00:01,000\nhi\n", encoding="utf-8")
-            return [p]
+            return NativeCaptureResult([p], [])
 
         monkeypatch.setattr(cli_mod, "extract_native_captions", fake_native)
 
@@ -735,7 +995,9 @@ class TestConfigKeepAudioResolution:
             "get_video_info",
             lambda url, cookies=None, quiet=False: {"title": "stub", "duration": 1},
         )
-        monkeypatch.setattr(cli_mod, "extract_native_captions", lambda *a, **kw: [])
+        from trans.downloader import NativeCaptureResult as _NCR
+
+        monkeypatch.setattr(cli_mod, "extract_native_captions", lambda *a, **kw: _NCR([], []))
 
         class StubEngine:
             def transcribe(self, audio, *, language=None, quiet=False, translate=False):
@@ -744,7 +1006,7 @@ class TestConfigKeepAudioResolution:
                     {"language": "en"},
                 )
 
-        monkeypatch.setattr(cli_mod, "TranscriptionEngine", lambda model: StubEngine())
+        monkeypatch.setattr(cli_mod, "TranscriptionEngine", lambda model, **_kw: StubEngine())
         monkeypatch.setattr(
             cli_mod, "CacheManager", lambda: CacheManager(db_path=tmp_path / "c.db")
         )
@@ -807,6 +1069,132 @@ class TestConfigKeepAudioResolution:
         assert result.exit_code == 0, result.output
         assert (tmp_path / "stub.audio.mp3").exists(), (
             "explicit -k must override cfg.keep_audio=False"
+        )
+
+    def test_no_keep_audio_beats_config_true(self, tmp_path, monkeypatch):
+        """`--no-keep-audio` must turn off keep_audio when cfg has it on.
+
+        Without the slash-form CLI declaration, Typer wouldn't expose a
+        `--no-keep-audio` flag — `cfg.keep_audio=true` would be permanent
+        until the user edits the config file. The slash form gives a
+        per-invocation escape hatch.
+        """
+        runner, cli_mod = self._setup_stubs(tmp_path, monkeypatch, cfg_keep_audio=True)
+        result = runner.invoke(
+            cli_mod.app,
+            [
+                "transcribe",
+                "--output-dir",
+                str(tmp_path),
+                "--no-keep-audio",
+                "--quiet",
+                "https://www.youtube.com/watch?v=fakefakefake",
+            ],
+        )
+        assert result.exit_code == 0, result.output
+        assert not (tmp_path / "stub.audio.mp3").exists(), (
+            "--no-keep-audio must override cfg.keep_audio=True"
+        )
+
+
+class TestNoFlagOverrides:
+    """`--no-clipboard` and `--no-quiet` paired with config truthy values.
+
+    `--no-keep-audio` is covered by `TestConfigKeepAudioResolution` (same
+    fixture, same shape) — these two tests round out the three
+    config-aware bool flags.
+    """
+
+    @staticmethod
+    def _setup_stubs(tmp_path, monkeypatch, *, cfg_clipboard=False, cfg_quiet=False):
+        from typer.testing import CliRunner
+
+        from trans import cli as cli_mod
+        from trans.cache import CacheManager
+        from trans.config import Config
+
+        monkeypatch.setattr(
+            cli_mod,
+            "load_config",
+            lambda: Config(clipboard=cfg_clipboard, quiet=cfg_quiet),
+        )
+
+        copies: list[str] = []
+        monkeypatch.setattr(cli_mod, "HAS_PYPERCLIP", True)
+
+        class FakePyperclip:
+            def copy(self, text):
+                copies.append(text)
+
+        monkeypatch.setattr(cli_mod, "pyperclip", FakePyperclip())
+
+        # Native captions branch returns one txt file so clipboard reads it.
+        def fake_native(url, out, fmt, quiet=True):
+            from trans.downloader import NativeCaptureResult
+
+            txt = Path(f"{out}.txt")
+            txt.write_text("hello\nworld\n", encoding="utf-8")
+            return NativeCaptureResult([txt], [])
+
+        monkeypatch.setattr(cli_mod, "extract_native_captions", fake_native)
+        monkeypatch.setattr(
+            cli_mod, "get_video_info", lambda url, **_: {"title": "stub", "duration": 1}
+        )
+        monkeypatch.setattr(
+            cli_mod, "CacheManager", lambda: CacheManager(db_path=tmp_path / "c.db")
+        )
+        return CliRunner(), cli_mod, copies
+
+    def test_no_clipboard_beats_config_true(self, tmp_path, monkeypatch):
+        runner, cli_mod, copies = self._setup_stubs(tmp_path, monkeypatch, cfg_clipboard=True)
+        result = runner.invoke(
+            cli_mod.app,
+            [
+                "transcribe",
+                "--output-dir",
+                str(tmp_path),
+                "--no-clipboard",
+                "--quiet",
+                "https://www.youtube.com/watch?v=fakefakefake",
+            ],
+        )
+        assert result.exit_code == 0, result.output
+        assert copies == [], "--no-clipboard must suppress the clipboard copy"
+
+    def test_clipboard_runs_when_config_true_and_no_override(self, tmp_path, monkeypatch):
+        """Positive control — cfg=True with no override still copies."""
+        runner, cli_mod, copies = self._setup_stubs(tmp_path, monkeypatch, cfg_clipboard=True)
+        result = runner.invoke(
+            cli_mod.app,
+            [
+                "transcribe",
+                "--output-dir",
+                str(tmp_path),
+                "--quiet",
+                "https://www.youtube.com/watch?v=fakefakefake",
+            ],
+        )
+        assert result.exit_code == 0, result.output
+        assert copies == ["hello\nworld\n"], "cfg.clipboard=True must trigger a copy"
+
+    def test_no_quiet_beats_config_true(self, tmp_path, monkeypatch):
+        """`--no-quiet` must surface the informational output even when cfg.quiet=True."""
+        runner, cli_mod, _ = self._setup_stubs(tmp_path, monkeypatch, cfg_quiet=True)
+        result = runner.invoke(
+            cli_mod.app,
+            [
+                "transcribe",
+                "--output-dir",
+                str(tmp_path),
+                "--no-quiet",
+                "https://www.youtube.com/watch?v=fakefakefake",
+            ],
+        )
+        assert result.exit_code == 0, result.output
+        # The "→ Checking for native captions..." line is one of the first
+        # informational prints. If quiet=True wins, it doesn't appear.
+        assert "Transcription complete" in result.output, (
+            "--no-quiet must restore informational output even when cfg.quiet=True"
         )
 
 
@@ -1027,18 +1415,29 @@ class TestCacheRoundTrip:
         CacheManager(db_path=db)
         assert not db.exists(), "constructing CacheManager must not touch the filesystem"
 
-    def test_native_captions_no_longer_cached(self, tmp_path, monkeypatch):
-        """Native-captions path must NOT write to the cache (post-contract behavior)."""
+    def test_native_captions_cached_on_put(self, tmp_path, monkeypatch):
+        """Native-captions success must populate the cache with source='native'.
+
+        Flipped from `test_native_captions_no_longer_cached` after
+        task-cache-native-captions landed. The CLI now caches the parsed
+        VTT segments so a subsequent run renders any format from canonical
+        segments without re-fetching.
+        """
         from trans import cli as cli_mod
         from trans.cache import CacheManager
         from trans.config import Config
+        from trans.downloader import NativeCaptureResult
 
         # Stub the native-captions write so it returns success without network.
-        # Return type matches the new contract: list[Path] of created files.
+        # New contract: NativeCaptureResult(files, segments).
+        parsed_segments = [
+            {"start": 0.0, "end": 2.0, "text": "captioned content"},
+        ]
+
         def fake_native(url, out_base, fmt, quiet):
             p = Path(f"{out_base}.txt")
             p.write_text("captioned content", encoding="utf-8")
-            return [p]
+            return NativeCaptureResult([p], parsed_segments)
 
         monkeypatch.setattr(cli_mod, "extract_native_captions", fake_native)
         monkeypatch.setattr(
@@ -1064,7 +1463,7 @@ class TestCacheRoundTrip:
             clipboard=False,
             keep_audio=False,
             timestamp=False,
-            quiet=False,  # exercise the iter-and-print loop so the stub's list[Path] is consumed
+            quiet=False,
             cookies=None,
             no_cache=False,
             force_whisper=False,
@@ -1076,10 +1475,125 @@ class TestCacheRoundTrip:
             config=cfg,
         )
         assert ok is True
-        # Critical assertion: native-captions success must not populate the cache
+        # Critical: native-captions success populates the cache with source='native'.
         from trans.utils import get_video_id
 
-        assert cache.get(get_video_id(url), ttl_days=30) is None
+        hit = cache.get(get_video_id(url), ttl_days=30)
+        assert hit is not None
+        assert hit.source == "native"
+        assert hit.segments == parsed_segments
+
+    def test_native_captions_empty_segments_skip_cache_write(self, tmp_path, monkeypatch):
+        """Malformed VTT yields empty segments — must NOT pollute the cache."""
+        from trans import cli as cli_mod
+        from trans.cache import CacheManager
+        from trans.config import Config
+        from trans.downloader import NativeCaptureResult
+
+        def fake_native(url, out_base, fmt, quiet):
+            p = Path(f"{out_base}.txt")
+            p.write_text("only-text-no-segments", encoding="utf-8")
+            return NativeCaptureResult([p], [])  # empty segments
+
+        monkeypatch.setattr(cli_mod, "extract_native_captions", fake_native)
+        monkeypatch.setattr(
+            cli_mod,
+            "get_video_info",
+            lambda url, cookies=None, quiet=False: {"title": "x", "duration": 1},
+        )
+
+        class StubEngine:
+            def transcribe(self, *a, **kw):
+                raise AssertionError("unreachable")
+
+        cache = CacheManager(db_path=tmp_path / "c.db")
+        url = "https://www.youtube.com/watch?v=fakefakefake"
+        ok = cli_mod._process_url(
+            url,
+            output=None,
+            output_dir=tmp_path,
+            model="base",
+            language=None,
+            fmt="txt",
+            clipboard=False,
+            keep_audio=False,
+            timestamp=False,
+            quiet=True,
+            cookies=None,
+            no_cache=False,
+            force_whisper=False,
+            diarize=False,
+            num_speakers=None,
+            translate=False,
+            engine=StubEngine(),
+            cache=cache,
+            config=Config(),
+        )
+        assert ok is True
+        from trans.utils import get_video_id
+
+        assert cache.get(get_video_id(url), ttl_days=30) is None, (
+            "empty segments must not result in a cache row"
+        )
+
+    def test_native_captions_offline_replay_from_cache(self, tmp_path, monkeypatch):
+        """After a native-captions run, a second run hits the cache even if extract crashes."""
+        from trans import cli as cli_mod
+        from trans.cache import CacheManager
+        from trans.config import Config
+        from trans.downloader import NativeCaptureResult
+
+        parsed_segments = [{"start": 0.0, "end": 1.0, "text": "replay"}]
+
+        def fake_native(url, out_base, fmt, quiet):
+            p = Path(f"{out_base}.txt")
+            p.write_text("replay", encoding="utf-8")
+            return NativeCaptureResult([p], parsed_segments)
+
+        monkeypatch.setattr(cli_mod, "extract_native_captions", fake_native)
+        monkeypatch.setattr(
+            cli_mod,
+            "get_video_info",
+            lambda url, cookies=None, quiet=False: {"title": "Replay", "duration": 1},
+        )
+
+        class UnreachableEngine:
+            def transcribe(self, *a, **kw):
+                raise AssertionError("must not transcribe on cache hit")
+
+        cache = CacheManager(db_path=tmp_path / "c.db")
+        url = "https://www.youtube.com/watch?v=fakefakefake"
+        kwargs = dict(
+            output=None,
+            output_dir=tmp_path,
+            model="base",
+            language=None,
+            fmt="txt",
+            clipboard=False,
+            keep_audio=False,
+            timestamp=False,
+            quiet=True,
+            cookies=None,
+            no_cache=False,
+            force_whisper=False,
+            diarize=False,
+            num_speakers=None,
+            translate=False,
+            engine=UnreachableEngine(),
+            cache=cache,
+            config=Config(),
+        )
+        # First run: populate cache.
+        assert cli_mod._process_url(url, **kwargs) is True
+
+        # Now simulate "extract crashes" (no network). The cache hit should
+        # short-circuit before extract_native_captions is even called.
+        def crashing_extract(*a, **kw):
+            raise RuntimeError("would have hit the network")
+
+        monkeypatch.setattr(cli_mod, "extract_native_captions", crashing_extract)
+        # Re-render to a fresh path so we can assert the output appeared.
+        assert cli_mod._process_url(url, **kwargs) is True
 
     def test_clipboard_copies_segments_text_on_cache_hit(self, tmp_path, monkeypatch):
         """B-1 fix: -c on a cache hit copies plain-text join regardless of --format."""
@@ -1430,6 +1944,91 @@ class TestConfigSetValue:
         assert loaded.diarization.hf_token == "tok_xyz"
 
 
+class TestClipboardErrorHandling:
+    """The narrow `except pyperclip.PyperclipException` keeps the friendly
+    warning path for pyperclip's own errors (no xclip on headless Linux,
+    Windows clipboard race, etc.) while letting genuinely unexpected
+    exceptions surface to the verbose handler.
+    """
+
+    def test_pyperclip_exception_prints_warning_and_continues(self, monkeypatch):
+        import pyperclip
+
+        from trans import cli as cli_mod
+
+        monkeypatch.setattr(cli_mod, "HAS_PYPERCLIP", True)
+
+        class _FakePyperclip:
+            PyperclipException = pyperclip.PyperclipException
+
+            def copy(self, _text):
+                raise pyperclip.PyperclipException("no clipboard backend")
+
+        monkeypatch.setattr(cli_mod, "pyperclip", _FakePyperclip())
+
+        # Should not raise — the warning prints and execution continues.
+        cli_mod._copy_to_clipboard("hello", quiet=False)
+
+
+class TestPythonDashMEntrypoint:
+    """`python -m trans` must work end-to-end via trans/__main__.py.
+
+    Replaces the legacy `trans_cli.py` shim. The PyPI `console_scripts`
+    entry already routes `trans` directly to `trans.cli:app`; this
+    test guards the dev invocation.
+    """
+
+    def test_python_dash_m_trans_version(self, tmp_path):
+        import subprocess
+
+        result = subprocess.run(
+            [sys.executable, "-m", "trans", "--version"],
+            capture_output=True,
+            text=True,
+            cwd=tmp_path,  # CWD-independent
+        )
+        assert result.returncode == 0, result.stderr
+        # The version line gets prefixed with "trans " from `_app_callback`.
+        assert "trans " in result.stdout
+
+
+class TestDeviceComputeFlags:
+    """`--device` / `--compute-type` CLI flags, config keys, and engine wiring."""
+
+    def test_engine_accepts_device_and_compute_type(self):
+        """Construction must not crash — the model is lazy-loaded, so no
+        faster-whisper invocation happens until `.model` is accessed."""
+        from trans.transcriber import TranscriptionEngine
+
+        engine = TranscriptionEngine("base", device="cpu", compute_type="int8")
+        assert engine.device == "cpu"
+        assert engine.compute_type == "int8"
+        assert engine._model is None  # still lazy
+
+    def test_config_round_trip_for_device_and_compute_type(self, tmp_path):
+        from trans.config import load_config, set_config_value
+
+        cfg_path = tmp_path / "config.toml"
+        set_config_value("device", "cuda", path=cfg_path)
+        set_config_value("compute_type", "float16", path=cfg_path)
+        loaded = load_config(path=cfg_path)
+        assert loaded.device == "cuda"
+        assert loaded.compute_type == "float16"
+
+    def test_invalid_device_rejected_by_cli(self, tmp_path, monkeypatch):
+        from typer.testing import CliRunner
+
+        from trans import cli as cli_mod
+
+        monkeypatch.chdir(tmp_path)
+        result = CliRunner().invoke(
+            cli_mod.app,
+            ["transcribe", "--device", "tpu", "--no-cache", "https://example.com/v"],
+        )
+        assert result.exit_code == 1
+        assert "Invalid device" in result.stdout
+
+
 class TestCacheManagerLifecycle:
     """Lifecycle ops: clear, stats, put-overwrite.
 
@@ -1466,16 +2065,34 @@ class TestCacheManagerLifecycle:
         cache = CacheManager(db_path=tmp_path / "c.db")
 
         # Never-touched: zero-state without creating the file (same public
-        # contract as clear() above).
+        # contract as clear() above). Schema includes the active/expired
+        # split — both zero on an empty DB.
         stats = cache.stats()
-        assert stats == {"count": 0, "size_mb": 0.0, "oldest": None, "newest": None}
+        assert stats == {
+            "count": 0,
+            "count_active": 0,
+            "count_expired": 0,
+            "size_mb": 0.0,
+            "oldest": None,
+            "newest": None,
+        }
         assert not (tmp_path / "c.db").exists()
 
         cache.put("yt_a", "u1", "T1", self._sample_segments("a"))
         cache.put("yt_b", "u2", "T2", self._sample_segments("b"))
         stats = cache.stats()
-        assert set(stats.keys()) == {"count", "size_mb", "oldest", "newest"}
+        assert set(stats.keys()) == {
+            "count",
+            "count_active",
+            "count_expired",
+            "size_mb",
+            "oldest",
+            "newest",
+        }
         assert stats["count"] == 2
+        # Without ttl_days, the active/expired split defaults to count/0.
+        assert stats["count_active"] == 2
+        assert stats["count_expired"] == 0
         assert stats["size_mb"] > 0
         assert stats["oldest"] is not None and stats["newest"] is not None
         assert stats["oldest"] <= stats["newest"]
@@ -1492,6 +2109,100 @@ class TestCacheManagerLifecycle:
         assert hit.title == "Second"
         assert hit.segments == [{"start": 0.0, "end": 1.0, "text": "beta"}]
         assert cache.stats()["count"] == 1
+
+
+class TestCachePrune:
+    """`prune` + auto-prune-on-put + stats() active/expired split."""
+
+    @staticmethod
+    def _insert_backdated(cache, video_id: str, days_old: int) -> None:
+        """Insert a row with a synthetic `created_at` so we can simulate aging.
+
+        `cache.put` uses CURRENT_TIMESTAMP; bypass that by going straight to
+        the connection for these probe rows.
+        """
+        import sqlite3
+
+        cache._ensure_schema()
+        with sqlite3.connect(cache._db) as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO transcripts "
+                "(video_id, url, title, segments_json, info_json, model, source, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now', ?))",
+                (
+                    video_id,
+                    "u",
+                    "T",
+                    '[{"start": 0.0, "end": 1.0, "text": "x"}]',
+                    None,
+                    "base",
+                    "whisper",
+                    f"-{days_old} days",
+                ),
+            )
+
+    def test_prune_removes_only_expired_rows(self, tmp_path):
+        from trans.cache import CacheManager
+
+        cache = CacheManager(db_path=tmp_path / "c.db")
+        self._insert_backdated(cache, "yt_old1", 60)
+        self._insert_backdated(cache, "yt_old2", 45)
+        self._insert_backdated(cache, "yt_fresh", 1)
+
+        removed = cache.prune(ttl_days=30)
+        assert removed == 2
+
+        # The fresh row survives.
+        assert cache.get("yt_fresh", ttl_days=30) is not None
+        # The old rows are gone — gone enough that even a query with a
+        # very-permissive ttl can't see them.
+        assert cache.get("yt_old1", ttl_days=10000) is None
+        assert cache.get("yt_old2", ttl_days=10000) is None
+
+    def test_prune_on_empty_db_returns_zero(self, tmp_path):
+        from trans.cache import CacheManager
+
+        cache = CacheManager(db_path=tmp_path / "c.db")
+        # Don't ensure schema first — confirms the no-file shortcut works.
+        assert cache.prune(ttl_days=7) == 0
+
+    def test_put_auto_prunes_expired(self, tmp_path):
+        """Every put() opportunistically evicts rows older than ttl_days.
+
+        Without this, the SQLite file grows unbounded — `get()` filters by
+        TTL on read but never deletes. The auto-prune keeps the file
+        bounded between manual `trans cache prune` invocations.
+        """
+        from trans.cache import CacheManager
+
+        cache = CacheManager(db_path=tmp_path / "c.db")
+        for i in range(5):
+            self._insert_backdated(cache, f"yt_old{i}", 60)
+
+        # One fresh put with ttl_days=30 should sweep all 5 expired rows.
+        cache.put(
+            "yt_fresh",
+            "u",
+            "Fresh",
+            [{"start": 0.0, "end": 1.0, "text": "hi"}],
+            ttl_days=30,
+        )
+
+        stats = cache.stats()
+        assert stats["count"] == 1
+        assert stats["count_active"] == 1
+
+    def test_stats_splits_active_and_expired(self, tmp_path):
+        from trans.cache import CacheManager
+
+        cache = CacheManager(db_path=tmp_path / "c.db")
+        self._insert_backdated(cache, "yt_old", 60)
+        self._insert_backdated(cache, "yt_fresh", 1)
+
+        stats = cache.stats(ttl_days=30)
+        assert stats["count"] == 2
+        assert stats["count_active"] == 1
+        assert stats["count_expired"] == 1
 
 
 class TestConfigFilePermissions:

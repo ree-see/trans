@@ -164,13 +164,25 @@ class CacheManager:
         info: dict[str, Any] | None = None,
         model: str | None = None,
         source: str = "whisper",
+        ttl_days: int = 30,
     ) -> None:
-        """Store segments + info for a video. Replaces any prior row for the same video_id."""
+        """Store segments + info for a video.
+
+        Replaces any prior row for the same ``video_id``. Also opportunistically
+        evicts rows older than ``ttl_days`` in the same transaction — auto-prune
+        on write keeps the SQLite file bounded without requiring users to run
+        ``trans cache prune`` by hand. Cheap operation; runs at write rate, which
+        is exactly when growth happens.
+        """
         self._ensure_schema()
         segments_json = json.dumps(_json_safe_segments(segments))
         info_json = json.dumps(_json_safe_info(info)) if info is not None else None
         conn = _connect(self._db)
         try:
+            conn.execute(
+                "DELETE FROM transcripts WHERE created_at < datetime('now', ?)",
+                (f"-{ttl_days} days",),
+            )
             conn.execute(
                 "INSERT OR REPLACE INTO transcripts "
                 "(video_id, url, title, segments_json, info_json, model, source) "
@@ -195,22 +207,73 @@ class CacheManager:
             conn.close()
         return count
 
-    def stats(self) -> dict[str, Any]:
-        """Return cache statistics."""
+    def prune(self, ttl_days: int = 30) -> int:
+        """Delete entries whose ``created_at`` is older than ``ttl_days``.
+
+        Returns the number of rows removed. Cheap and idempotent — safe to
+        invoke from a manual ``trans cache prune`` subcommand. Pre-1.0 the
+        TTL is whatever the caller passes; the CLI defaults to
+        ``cfg.cache.ttl_days``.
+        """
         if not self._db.exists():
-            return {"count": 0, "size_mb": 0.0, "oldest": None, "newest": None}
+            return 0
         self._ensure_schema()
         conn = _connect(self._db)
         try:
-            row = conn.execute(
+            cursor = conn.execute(
+                "DELETE FROM transcripts WHERE created_at < datetime('now', ?)",
+                (f"-{ttl_days} days",),
+            )
+            count = cursor.rowcount
+            conn.commit()
+        finally:
+            conn.close()
+        return count
+
+    def stats(self, ttl_days: int | None = None) -> dict[str, Any]:
+        """Return cache statistics.
+
+        Without ``ttl_days``, the result has the historical shape
+        (``count`` / ``size_mb`` / ``oldest`` / ``newest``) plus
+        ``count_active`` (= ``count``) and ``count_expired`` (= 0) so
+        callers can always read the active/expired split without
+        branching on the call shape.
+
+        With ``ttl_days``, ``count_active`` reflects rows newer than the
+        cutoff and ``count_expired`` reflects rows older.
+        """
+        if not self._db.exists():
+            return {
+                "count": 0,
+                "count_active": 0,
+                "count_expired": 0,
+                "size_mb": 0.0,
+                "oldest": None,
+                "newest": None,
+            }
+        self._ensure_schema()
+        conn = _connect(self._db)
+        try:
+            total_row = conn.execute(
                 "SELECT COUNT(*), MIN(created_at), MAX(created_at) FROM transcripts"
             ).fetchone()
+            if ttl_days is None:
+                active = total_row[0] or 0
+                expired = 0
+            else:
+                active = conn.execute(
+                    "SELECT COUNT(*) FROM transcripts WHERE created_at > datetime('now', ?)",
+                    (f"-{ttl_days} days",),
+                ).fetchone()[0]
+                expired = (total_row[0] or 0) - active
         finally:
             conn.close()
         size_mb = self._db.stat().st_size / (1024 * 1024)
         return {
-            "count": row[0] or 0,
+            "count": total_row[0] or 0,
+            "count_active": active,
+            "count_expired": expired,
             "size_mb": round(size_mb, 2),
-            "oldest": row[1],
-            "newest": row[2],
+            "oldest": total_row[1],
+            "newest": total_row[2],
         }

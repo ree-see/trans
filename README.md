@@ -131,6 +131,22 @@ trans transcribe -m medium "URL"    # High accuracy
 trans transcribe -m large  "URL"    # Best accuracy, slowest
 ```
 
+### Whisper Device and Compute Type
+
+`trans` defaults to CPU with int8 quantization — the safest choice across machines. If you have a CUDA GPU (or a faster-whisper wheel with Metal support on Apple Silicon), you can opt into hardware acceleration per invocation or via config:
+
+```bash
+trans transcribe --device cuda --compute-type float16 "URL"
+trans config set device cuda
+trans config set compute_type float16
+```
+
+Trade-offs:
+- `--device`: `cpu` (default, universal), `cuda` (5-10x faster on midrange GPUs), `auto` (pick best available)
+- `--compute-type`: `int8` (default, smallest memory), `int8_float16`, `float16`, `float32` (most accurate, highest memory)
+
+Metal support on Apple Silicon depends on the specific `faster-whisper` wheel; not all combinations work out of the box.
+
 ### Language Options
 
 ```bash
@@ -233,12 +249,17 @@ trans transcribe --cookies cookies.txt "https://tiktok.com/@user/video/123"
 Transcripts are cached automatically (default TTL: 30 days):
 
 ```bash
-# Show cache stats
+# Show cache stats — total / active / expired counts, oldest / newest
 trans cache stats
+
+# Delete only expired entries (no-op on fresh rows)
+trans cache prune
 
 # Clear all cached transcripts
 trans cache clear
 ```
+
+`put` auto-prunes expired rows in the same transaction it writes a new entry, so the SQLite file stays bounded between manual `prune` runs.
 
 ## Persistent Configuration
 
@@ -254,8 +275,21 @@ trans config set format srt
 trans config set output_dir ~/transcripts
 trans config set clipboard true
 trans config set quiet true
+trans config set device cuda
+trans config set compute_type float16
 trans config set cache.ttl_days 60
 trans config set diarization.hf_token hf_your_token_here
+```
+
+### Per-invocation overrides
+
+The `clipboard`, `keep_audio`, and `quiet` flags all support paired `--no-*` forms so you can disable them once without editing the config:
+
+```bash
+trans config set clipboard true
+trans transcribe --no-clipboard "URL"   # skip clipboard copy for this run only
+trans transcribe --no-keep-audio "URL"  # same idea for keep_audio
+trans transcribe --no-quiet "URL"       # re-enable informational output
 ```
 
 Config is stored in the OS-appropriate location:
@@ -381,6 +415,7 @@ TikTok aggressively blocks datacenter IPs. If you see "IP address is blocked":
 | Whisper is slow | Use a smaller model: `-m tiny` |
 | Wrong language detected | Specify explicitly: `-l en` |
 | TikTok blocked | See TikTok Notes above |
+| `Unexpected error:` with no detail | Re-run with `trans -v <subcommand> ...` for a full traceback on stderr. The `-v` flag must appear BEFORE the subcommand. |
 
 ## Development
 
