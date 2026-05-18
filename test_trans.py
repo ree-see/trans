@@ -463,6 +463,136 @@ class TestBatchPrefetch:
         assert calls["download"] == 1
 
 
+class TestConfigBoolRoundTrip:
+    """Round-trip every bool config key: write via set_config_value, reload, assert.
+
+    Catches the family of bugs where a SETTABLE_KEYS bool key drifts out of sync
+    between the Config dataclass, the TOML writer, and the typed-value parser in
+    set_config_value.
+    """
+
+    @pytest.mark.parametrize(
+        "key,attr",
+        [
+            ("clipboard", "clipboard"),
+            ("quiet", "quiet"),
+            ("keep_audio", "keep_audio"),
+        ],
+    )
+    def test_bool_key_round_trip(self, tmp_path, key, attr):
+        from trans.config import load_config, set_config_value
+
+        cfg_path = tmp_path / "config.toml"
+        set_config_value(key, "true", path=cfg_path)
+        assert getattr(load_config(path=cfg_path), attr) is True
+        set_config_value(key, "false", path=cfg_path)
+        assert getattr(load_config(path=cfg_path), attr) is False
+
+
+class TestConfigKeepAudioResolution:
+    """Regression guard for the silently-ignored `keep_audio` config key.
+
+    Pre-fix: `keep_audio: bool = typer.Option(False, ...)` short-circuits the
+    `_resolve_bool(cli, cfg)` pattern because the CLI default is never `None`.
+    Setting `cfg.keep_audio = true` had no effect — the bug this fix removes.
+    """
+
+    @staticmethod
+    def _setup_stubs(tmp_path, monkeypatch, *, cfg_keep_audio: bool):
+        from typer.testing import CliRunner
+
+        from trans import cli as cli_mod
+        from trans.cache import CacheManager
+        from trans.config import Config
+
+        monkeypatch.setattr(cli_mod, "load_config", lambda: Config(keep_audio=cfg_keep_audio))
+
+        def fake_download(url, output_path, cookies=None, quiet=False, **_):
+            final = output_path if str(output_path).endswith(".mp3") else f"{output_path}.mp3"
+            Path(final).write_bytes(b"\x00" * 1024)
+            return final
+
+        monkeypatch.setattr(cli_mod, "download_audio", fake_download)
+        monkeypatch.setattr(
+            cli_mod,
+            "get_video_info",
+            lambda url, cookies=None, quiet=False: {"title": "stub", "duration": 1},
+        )
+        monkeypatch.setattr(cli_mod, "extract_native_captions", lambda *a, **kw: False)
+
+        class StubEngine:
+            def transcribe(self, audio, *, language=None, quiet=False, translate=False):
+                return (
+                    [{"start": 0.0, "end": 1.0, "text": "x"}],
+                    {"language": "en"},
+                )
+
+        monkeypatch.setattr(cli_mod, "TranscriptionEngine", lambda model: StubEngine())
+        monkeypatch.setattr(
+            cli_mod, "CacheManager", lambda: CacheManager(db_path=tmp_path / "c.db")
+        )
+        return CliRunner(), cli_mod
+
+    def test_config_keep_audio_true_retains_audio_without_flag(self, tmp_path, monkeypatch):
+        """cfg.keep_audio=True + no -k flag must retain the audio file."""
+        runner, cli_mod = self._setup_stubs(tmp_path, monkeypatch, cfg_keep_audio=True)
+        result = runner.invoke(
+            cli_mod.app,
+            [
+                "transcribe",
+                "--output-dir",
+                str(tmp_path),
+                "--quiet",
+                "https://www.youtube.com/watch?v=fakefakefake",
+            ],
+        )
+        assert result.exit_code == 0, result.output
+        assert (tmp_path / "stub.audio.mp3").exists(), (
+            "config keep_audio=true was silently ignored — audio was deleted"
+        )
+
+    def test_config_keep_audio_false_default_removes_audio(self, tmp_path, monkeypatch):
+        """Positive control: cfg.keep_audio=False + no -k → audio removed.
+
+        Proves the stub fixture writes/deletes a real path at the asserted
+        location, so the True-case test can't pass for the wrong reason.
+        """
+        runner, cli_mod = self._setup_stubs(tmp_path, monkeypatch, cfg_keep_audio=False)
+        result = runner.invoke(
+            cli_mod.app,
+            [
+                "transcribe",
+                "--output-dir",
+                str(tmp_path),
+                "--quiet",
+                "https://www.youtube.com/watch?v=fakefakefake",
+            ],
+        )
+        assert result.exit_code == 0, result.output
+        assert not (tmp_path / "stub.audio.mp3").exists(), (
+            "fixture sanity: audio must be removed when keep_audio is False"
+        )
+
+    def test_cli_flag_overrides_config_false(self, tmp_path, monkeypatch):
+        """CLI `-k` must beat `cfg.keep_audio=False` — the other half of the precedence rule."""
+        runner, cli_mod = self._setup_stubs(tmp_path, monkeypatch, cfg_keep_audio=False)
+        result = runner.invoke(
+            cli_mod.app,
+            [
+                "transcribe",
+                "--output-dir",
+                str(tmp_path),
+                "-k",
+                "--quiet",
+                "https://www.youtube.com/watch?v=fakefakefake",
+            ],
+        )
+        assert result.exit_code == 0, result.output
+        assert (tmp_path / "stub.audio.mp3").exists(), (
+            "explicit -k must override cfg.keep_audio=False"
+        )
+
+
 class TestPackageImports:
     """Regression guards on the public package surface."""
 

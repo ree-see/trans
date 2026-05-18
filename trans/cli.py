@@ -106,6 +106,16 @@ def _resolve(cli_val, config_val, default):
     return config_val if config_val else default
 
 
+def _resolve_bool(cli_val: bool | None, cfg_val: bool) -> bool:
+    """Return cli_val when the user passed the flag, else cfg_val.
+
+    A bool CLI flag declared as ``Option(False, ...)`` can never be ``None``,
+    so it always wins over the config value. Every config-aware bool flag must
+    therefore default to ``None`` and route through this helper.
+    """
+    return cli_val if cli_val is not None else cfg_val
+
+
 # ---------------------------------------------------------------------------
 # URL processing
 # ---------------------------------------------------------------------------
@@ -404,9 +414,7 @@ def transcribe(
         None, "-f", "--format", help=f"Output format: {', '.join(OUTPUT_FORMATS)}"
     ),
     clipboard: bool = typer.Option(None, "-c", "--clipboard", help="Copy transcript to clipboard."),
-    keep_audio: bool = typer.Option(
-        False, "-k", "--keep-audio", help="Keep downloaded audio file."
-    ),
+    keep_audio: bool = typer.Option(None, "-k", "--keep-audio", help="Keep downloaded audio file."),
     timestamp: bool = typer.Option(
         False, "-t", "--timestamp", help="Add timestamp to output filename."
     ),
@@ -438,8 +446,9 @@ def transcribe(
     eff_model = _resolve(model, cfg.model, "base")
     eff_format = _resolve(format, cfg.format, "txt")
     eff_language = _resolve(language, cfg.language, None)
-    eff_clipboard = clipboard if clipboard is not None else cfg.clipboard
-    eff_quiet = quiet if quiet is not None else cfg.quiet
+    eff_clipboard = _resolve_bool(clipboard, cfg.clipboard)
+    eff_quiet = _resolve_bool(quiet, cfg.quiet)
+    eff_keep_audio = _resolve_bool(keep_audio, cfg.keep_audio)
 
     # Validate
     if eff_model not in WHISPER_MODELS:
@@ -542,7 +551,7 @@ def transcribe(
                     language=eff_language,
                     fmt=eff_format,
                     clipboard=eff_clipboard,
-                    keep_audio=keep_audio,
+                    keep_audio=eff_keep_audio,
                     timestamp=timestamp,
                     quiet=eff_quiet,
                     cookies=cookies,
